@@ -1,0 +1,220 @@
+sensor_types:
+  ev_charger:
+    name_aliases: [ev-charger, ev_charger]
+    sosa_sensor_uri: https://w3id.org/seas/EVChargingStation
+    primary_field: soc_pct
+    fields:
+      state:
+        datatype: string
+        enum: [idle, charging, complete, fault]
+        measurement_type: multi
+        aliases: [charger_state, charging_state]
+      power_kw:
+        datatype: number
+        min: 0
+        max: 350
+        unit: kW
+        unit_uri: http://qudt.org/vocab/unit/KiloW
+        observable_property_uri: http://qudt.org/vocab/quantitykind/Power
+        measurement_type: active_power
+        aliases: [charger_power_kw, ev_power_kw]
+      soc_pct:
+        datatype: number
+        min: 0
+        max: 100
+        unit: percent
+        unit_uri: http://qudt.org/vocab/unit/PERCENT
+        observable_property_uri: http://qudt.org/vocab/quantitykind/Dimensionless
+        measurement_type: soc
+        aliases: [soc, state_of_charge]
+      session_kwh:
+        datatype: number
+        min: 0
+        max: 1000
+        unit: kWh
+        unit_uri: http://qudt.org/vocab/unit/KiloW-HR
+        observable_property_uri: http://qudt.org/vocab/quantitykind/Energy
+        measurement_type: energy
+        aliases: [session_energy, charge_kwh]
+      voltage_v:
+        datatype: number
+        min: 0
+        max: 1000
+        unit: V
+        unit_uri: http://qudt.org/vocab/unit/V
+        observable_property_uri: http://qudt.org/vocab/quantitykind/Voltage
+        measurement_type: voltage
+        aliases: [voltage, volts]
+      current_a:
+        datatype: number
+        min: 0
+        max: 1000
+        unit: A
+        unit_uri: http://qudt.org/vocab/unit/A
+        observable_property_uri: http://qudt.org/vocab/quantitykind/ElectricCurrent
+        measurement_type: current
+        aliases: [current, amps]
+
+  air_quality:
+    name_aliases: [air-quality, air_quality]
+    sosa_sensor_uri: http://www.w3.org/ns/sosa/Sensor
+    primary_field: pm2_5_ugm3
+    fields:
+      pm2_5_ugm3:
+        datatype: number
+        min: 0
+        max: 1000
+        unit: ug/m3
+        unit_uri: http://qudt.org/vocab/unit/MicroGM-PER-M3
+        observable_property_uri: http://qudt.org/vocab/quantitykind/MassConcentration
+        measurement_type: pm2_5
+        aliases: [pm25, pm2_5]
+      pm10_ugm3:
+        datatype: number
+        min: 0
+        max: 1000
+        unit: ug/m3
+        unit_uri: http://qudt.org/vocab/unit/MicroGM-PER-M3
+        observable_property_uri: http://qudt.org/vocab/quantitykind/MassConcentration
+        measurement_type: pm2_5
+        aliases: [pm10, pm_10]
+      voc_ppb:
+        datatype: number
+        min: 0
+        max: 20000
+        unit: ppb
+        unit_uri: http://qudt.org/vocab/unit/PPB
+        observable_property_uri: http://qudt.org/vocab/quantitykind/MoleFraction
+        measurement_type: co2
+        aliases: [voc, tvoc]
+      aqi:
+        datatype: integer
+        min: 0
+        max: 500
+        unit: AQI
+        unit_uri: http://qudt.org/vocab/unit/UNITLESS
+        observable_property_uri: http://qudt.org/vocab/quantitykind/Dimensionless
+        measurement_type: aqi
+        aliases: [air_quality_index, aq_index]
+
+  climate:
+    name_aliases: [climate]
+    sosa_sensor_uri: http://www.w3.org/ns/sosa/Sensor
+    primary_field: temperature_c
+    fields:
+      temperature_c:
+        datatype: number
+        min: -50
+        max: 150
+        unit: degC
+        unit_uri: http://qudt.org/vocab/unit/DEG_C
+        observable_property_uri: http://qudt.org/vocab/quantitykind/Temperature
+        measurement_type: temperature
+        aliases: [temp_c, temperature]
+      humidity_pct:
+        datatype: number
+        min: 0
+        max: 100
+        unit: percent
+        unit_uri: http://qudt.org/vocab/unit/PERCENT
+        observable_property_uri: http://qudt.org/vocab/quantitykind/RelativeHumidity
+        measurement_type: humidity
+        aliases: [humidity, rh]
+      co2_ppm:
+        datatype: integer
+        min: 300
+        max: 10000
+        unit: ppm
+        unit_uri: http://qudt.org/vocab/unit/PPM
+        observable_property_uri: http://qudt.org/vocab/quantitykind/MoleFraction
+        measurement_type: co2
+        aliases: [co2, carbon_dioxide]
+      hvac_state:
+        datatype: string
+        enum: [cooling, idle, heating, off]
+        measurement_type: multi
+        aliases: [hvac, hvac_mode]
+
+  water:
+    name_aliases: [water]
+    sosa_sensor_uri: https://w3id.org/seas/WaterMeter
+    primary_field: flow_lpm
+    fields:
+      flow_lpm:
+        datatype: number
+        min: 0
+        max: 5000
+        unit: L/min
+        unit_uri: http://qudt.org/vocab/unit/L-PER-MIN
+        observable_property_uri: http://qudt.org/vocab/quantitykind/VolumeFlowRate
+        measurement_type: flow
+        aliases: [flow, flow_rate_lpm]
+      total_m3:
+        datatype: number
+        min: 0
+        max: 1000000
+        unit: m3
+        unit_uri: http://qudt.org/vocab/unit/M3
+        observable_property_uri: http://qudt.org/vocab/quantitykind/Volume
+        measurement_type: flow
+        aliases: [total_volume, volume_m3]
+      pressure_bar:
+        datatype: number
+        min: 0
+        max: 20
+        unit: bar
+        unit_uri: http://qudt.org/vocab/unit/BAR
+        observable_property_uri: http://qudt.org/vocab/quantitykind/Pressure
+        measurement_type: pressure
+        aliases: [pressure, press_bar]
+      leak_detected:
+        datatype: boolean
+        measurement_type: multi
+        aliases: [leak, leak_flag]
+
+  energy:
+    name_aliases: [energy, meter]
+    sosa_sensor_uri: https://w3id.org/seas/ElectricityMeter
+    primary_field: power_w
+    fields:
+      power_w:
+        datatype: number
+        min: 0
+        max: 100000
+        unit: W
+        unit_uri: http://qudt.org/vocab/unit/W
+        observable_property_uri: http://qudt.org/vocab/quantitykind/Power
+        measurement_type: active_power
+        aliases: [power, watts]
+      voltage_v:
+        datatype: number
+        min: 0
+        max: 500
+        unit: V
+        unit_uri: http://qudt.org/vocab/unit/V
+        observable_property_uri: http://qudt.org/vocab/quantitykind/Voltage
+        measurement_type: voltage
+        aliases: [voltage, volts]
+      current_a:
+        datatype: number
+        min: -1000
+        max: 1000
+        unit: A
+        unit_uri: http://qudt.org/vocab/unit/A
+        observable_property_uri: http://qudt.org/vocab/quantitykind/ElectricCurrent
+        measurement_type: current
+        aliases: [current, amps]
+      energy_kwh:
+        datatype: number
+        min: 0
+        max: 1000000
+        unit: kWh
+        unit_uri: http://qudt.org/vocab/unit/KiloW-HR
+        observable_property_uri: http://qudt.org/vocab/quantitykind/Energy
+        measurement_type: energy
+        aliases: [energy, kwh]
+      phase:
+        datatype: string
+        enum: [1P, 2P, 3P]
+        measurement_type: multi
+        aliases: [phase_type]

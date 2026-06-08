@@ -1,0 +1,192 @@
+scheming_version: 2
+dataset_type: dataset
+about: Schema for FAIR-compliant energy sensor datasets (thesis project)
+about_url: https://github.com/ckan/ckanext-scheming
+
+dataset_fields:
+
+  - field_name: title
+    label: Title
+    preset: title
+    form_placeholder: eg. Solar Inverter C
+
+  - field_name: name
+    label: URL
+    preset: dataset_slug
+    form_placeholder: eg. sensor-solar-inverter-c
+
+  - field_name: notes
+    label: Description
+    form_snippet: markdown.html
+    form_placeholder: eg. Rooftop PV array inverter (bidirectional metering).
+
+  - field_name: tag_string
+    label: Tags
+    preset: tag_string_autocomplete
+    form_placeholder: eg. energy, solar, inverter
+
+  - field_name: license_id
+    label: License
+    form_snippet: license.html
+    help_text: License under which the dataset is released.
+
+  - field_name: owner_org
+    label: Organization
+    preset: dataset_organization
+
+  # --- Sensor-specific fields ---
+
+  - field_name: sensor_type
+    label: Sensor Type
+    help_text: Category of energy/utility sensor.
+    preset: select
+    choices:
+      - value: climate
+        label: Climate Sensor
+      - value: energy
+        label: Energy Meter
+      - value: water
+        label: Water Meter
+      - value: air_quality
+        label: Air Quality Sensor
+      - value: ev_charger
+        label: EV Charger
+      - value: industrial_meter
+        label: Industrial Meter
+      - value: residential_meter
+        label: Residential Meter
+      - value: solar_inverter
+        label: Solar Inverter
+      - value: hvac
+        label: HVAC Unit
+      - value: other
+        label: Other
+
+  - field_name: protocol
+    label: Communication Protocol
+    preset: select
+    choices:
+      - value: mqtt
+        label: MQTT
+      - value: coap
+        label: CoAP
+      - value: http
+        label: HTTP
+      - value: modbus
+        label: Modbus
+      - value: opcua
+        label: OPC-UA
+
+  - field_name: measurement_type
+    label: Primary Measurement
+    preset: select
+    choices:
+      - value: active_power
+        label: Active Power (W)
+      - value: voltage
+        label: Voltage (V)
+      - value: current
+        label: Current (A)
+      - value: energy
+        label: Energy (kWh)
+      - value: temperature
+        label: Temperature (C)
+      - value: humidity
+        label: Humidity (%)
+      - value: co2
+        label: CO2 (ppm)
+      - value: flow
+        label: Flow (L/min)
+      - value: pressure
+        label: Pressure (bar)
+      - value: pm2_5
+        label: PM2.5 (µg/m³)
+      - value: aqi
+        label: Air Quality Index
+      - value: soc
+        label: State of Charge (%)
+      - value: multi
+        label: Multi-parameter
+
+  - field_name: unit
+    label: Measurement Unit
+    form_placeholder: eg. W, kWh, V, A
+
+  - field_name: latitude
+    label: Latitude
+    validators: ignore_missing unicode_safe
+    form_placeholder: eg. 50.7753
+
+  - field_name: longitude
+    label: Longitude
+    validators: ignore_missing unicode_safe
+    form_placeholder: eg. 6.0839
+
+  - field_name: thingsboard_device_id
+    label: ThingsBoard Device ID
+    help_text: UUID of the corresponding device in ThingsBoard.
+    validators: ignore_missing unicode_safe
+
+  - field_name: sampling_interval_s
+    label: Sampling Interval (seconds)
+    validators: ignore_missing int_validator
+    form_placeholder: eg. 5
+
+  # --- FAIR enrichment fields (auto-populated by FAIR Bridge) ---
+
+  - field_name: dataset_uuid
+    label: Dataset UUID
+    help_text: Persistent global identifier (FAIR F1).
+    validators: ignore_missing unicode_safe
+
+  - field_name: sosa_sensor_uri
+    label: SOSA Sensor URI
+    help_text: W3C SSN/SOSA class URI describing this sensor (FAIR I2).
+    validators: ignore_missing unicode_safe
+
+  - field_name: sosa_observable_property_uri
+    label: Observable Property URI
+    help_text: QUDT QuantityKind URI for the primary measurand (FAIR I2).
+    validators: ignore_missing unicode_safe
+
+  - field_name: qudt_unit_uri
+    label: QUDT Unit URI
+    help_text: Standardised unit-of-measure URI (FAIR I2).
+    validators: ignore_missing unicode_safe
+
+  - field_name: spatial
+    label: Spatial (GeoJSON)
+    help_text: GeoJSON geometry.
+    validators: ignore_missing unicode_safe
+
+  - field_name: created_at_iso
+    label: Created (UTC ISO 8601)
+    validators: ignore_missing unicode_safe
+
+  - field_name: updated_at_iso
+    label: Updated (UTC ISO 8601)
+    validators: ignore_missing unicode_safe
+
+  - field_name: provenance_json
+    label: Provenance (PROV-JSON)
+    help_text: W3C PROV-O lineage of enrichment activities (FAIR R1.2).
+    validators: ignore_missing unicode_safe
+
+resource_fields:
+
+  - field_name: url
+    label: URL
+    preset: resource_url_upload
+
+  - field_name: name
+    label: Name
+    form_placeholder: eg. Monthly readings CSV
+
+  - field_name: description
+    label: Description
+    form_snippet: markdown.html
+    form_placeholder: Optional resource description.
+
+  - field_name: format
+    label: Format
+    preset: resource_format_autocomplete

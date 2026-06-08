@@ -1,0 +1,354 @@
+volumes:
+  # CKAN stack （nginx + ckan + db + solr + redis + datapusher）
+  ckan_storage:
+  pg_data:
+  solr_data:
+  # ThingsBoard stack （thingsboard + tb-db + kafka + kafka-ui）
+  tb_data:
+  tb_logs:
+  tb_pg_data:
+  kafka_data:
+  telemetry_exports:
+
+services:
+
+  nginx:
+    build:
+      context: nginx/
+      dockerfile: Dockerfile
+    networks:
+      - ckannet
+      - webnet
+    depends_on:
+      ckan:
+        condition: service_healthy
+    ports:
+      - "0.0.0.0:${NGINX_SSLPORT_HOST}:${NGINX_SSLPORT}"
+
+  ckan:
+    build:
+      context: ckan/
+      dockerfile: Dockerfile
+      args:
+        - TZ=${TZ}
+    networks:
+      - ckannet
+      - dbnet
+      - solrnet
+      - redisnet
+    env_file:
+      - .env
+    environment:
+      UWSGI_OPTS: "--plugins python3,http --socket /tmp/uwsgi.sock --wsgi-file /srv/app/wsgi.py --module wsgi:application --http [::]:5000 --master --enable-threads --lazy-apps -p 2 -L -b 32768 --vacuum --harakiri 60"
+    depends_on:
+      db:
+        condition: service_healthy
+      solr:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ckan_storage:/var/lib/ckan
+      - ./ckan/schemas:/srv/app/schemas:ro
+      - ./ckan/docker-entrypoint.d:/docker-entrypoint.d:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://localhost:5000/api/action/status_show"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
+  datapusher:
+    networks:
+      - ckannet
+      - dbnet
+    image: ckan/ckan-base-datapusher:${DATAPUSHER_VERSION}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://localhost:8800"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
+  db:
+    build:
+      context: postgresql/
+    networks:
+      - dbnet
+    environment:
+      - POSTGRES_USER
+      - POSTGRES_PASSWORD
+      - POSTGRES_DB
+      - CKAN_DB_USER
+      - CKAN_DB_PASSWORD
+      - CKAN_DB
+      - DATASTORE_READONLY_USER
+      - DATASTORE_READONLY_PASSWORD
+      - DATASTORE_DB
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}", "-d", "${POSTGRES_DB}"]
+
+  solr:
+    networks:
+      - solrnet
+    image: ckan/ckan-solr:${SOLR_IMAGE_VERSION}
+    volumes:
+      - solr_data:/var/solr
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://localhost:8983/solr/"]
+
+  redis:
+    image: redis:${REDIS_VERSION}
+    networks:
+      - redisnet
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "-e", "QUIT"]
+
+  # Operational Layer )
+  tb-setup:
+    image: thingsboard/tb-node:${TB_VERSION}
+    user: root
+    restart: "no"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://tb-db:5432/thingsboard
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: ${TB_DB_PASS}
+      LOAD_DEMO: "${TB_LOAD_DEMO:-false}"
+    depends_on:
+      tb-db:
+        condition: service_healthy
+    volumes:
+      - tb_data:/data
+    networks:
+      - tbnet
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        if [ -f /data/.tb_installed ]; then
+          echo "[tb-setup] marker /data/.tb_installed present, schema already installed — skipping."
+          exit 0
+        fi
+        echo "[tb-setup] running ThingsBoard install (LOAD_DEMO=$${LOAD_DEMO})..."
+        if [ "$${LOAD_DEMO}" = "true" ]; then
+          /usr/share/thingsboard/bin/install/install.sh --loadDemo
+        else
+          /usr/share/thingsboard/bin/install/install.sh
+        fi
+        touch /data/.tb_installed
+        echo "[tb-setup] install complete, marker written."
+
+  thingsboard:
+    image: thingsboard/tb-node:${TB_VERSION}
+    restart: unless-stopped
+    ports:
+      - "${TB_HTTP_PORT}:8080"              # Web UI       → localhost:8080
+      - "${TB_RPC_PORT}:7070"               # gRPC / Edge
+      - "${TB_MQTT_PORT}:1883"              # MQTT (plain)
+      - "8883:8883"                         # MQTT over TLS
+      - "5683-5688:5683-5688/udp"           # CoAP / LwM2M
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "10"
+    environment:
+      TB_SERVICE_ID: tb-ce-node
+      TB_QUEUE_TYPE: kafka
+      TB_KAFKA_SERVERS: kafka:9092
+      SPRING_DATASOURCE_URL: jdbc:postgresql://tb-db:5432/thingsboard
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: ${TB_DB_PASS}
+    depends_on:
+      tb-setup:
+        condition: service_completed_successfully
+      tb-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    volumes:
+      - tb_data:/data
+      - tb_logs:/var/log/thingsboard
+    networks:
+      - tbnet
+
+  tb-db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: thingsboard
+      POSTGRES_PASSWORD: ${TB_DB_PASS}
+    volumes:
+      - tb_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d thingsboard"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - tbnet
+
+  kafka:
+    image: bitnamilegacy/kafka:4.0
+    hostname: kafka
+    restart: unless-stopped
+    ports:
+      - "${KAFKA_PORT}:9092"
+    environment:
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+      KAFKA_CFG_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      # KRaft mode, no ZooKeeper
+      KAFKA_CFG_PROCESS_ROLES: "controller,broker"
+      KAFKA_CFG_NODE_ID: "0"
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: "0@kafka:9093"
+      # Single node replication
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      # One day retention 
+      KAFKA_CFG_LOG_RETENTION_MS: "86400000"
+      KAFKA_CFG_SEGMENT_BYTES: "26214400"
+    volumes:
+      - kafka_data:/bitnami
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list 2>/dev/null || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - tbnet
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    restart: unless-stopped
+    ports:
+      - "${KAFKA_UI_PORT}:8080"             # Kafka UI → localhost:9090
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      - kafka
+    networks:
+      - tbnet
+
+
+  # FAIR Bridge — Metadata Enricher (Kafka lifecycle → CKAN datasets)
+  fair-bridge:
+    build:
+      context: fair-bridge/
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      ckan:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC_LIFECYCLE: tb.device.lifecycle
+      CKAN_URL: http://ckan:5000
+      CKAN_API_KEY: ${CKAN_API_KEY}
+      CKAN_ORG: acs-eonerc
+      CKAN_ORG_TITLE: ACS EONERC
+      TB_URL: http://thingsboard:8080
+      TB_USERNAME: ${TB_USERNAME}
+      TB_PASSWORD: ${TB_PASSWORD}
+      REGISTRY_PATH: /app/registry/field_registry.yaml
+    volumes:
+      - ./fair-bridge/registry:/app/registry:ro
+    networks:
+      - ckannet
+      - tbnet
+
+  # FAIR Bridge — ETL pipeline (Kafka tb.telemetry.raw → validated / DLQ)
+  fair-bridge-etl:
+    build:
+      context: fair-bridge/
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: ["python", "-u", "etl.py"]
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC_TELEMETRY_RAW: tb.telemetry.raw
+      KAFKA_TOPIC_TELEMETRY_VALIDATED: tb.telemetry.validated
+      KAFKA_TOPIC_DLQ: bridge.dlq
+      KAFKA_CONSUMER_GROUP_ETL: fair-bridge-etl
+      REGISTRY_PATH: /app/registry/field_registry.yaml
+    volumes:
+      - ./fair-bridge/registry:/app/registry:ro
+    networks:
+      - tbnet
+
+  # FAIR Bridge — Telemetry exporter (validated Kafka telemetry → daily CKAN CSV resources)
+  fair-bridge-telemetry-exporter:
+    build:
+      context: fair-bridge/
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      ckan:
+        condition: service_healthy
+    command: ["python", "-u", "telemetry_exporter.py"]
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC_TELEMETRY_VALIDATED: tb.telemetry.validated
+      KAFKA_CONSUMER_GROUP_EXPORTER: fair-bridge-telemetry-exporter
+      CKAN_URL: http://ckan:5000
+      CKAN_API_KEY: ${CKAN_API_KEY}
+      CKAN_ORG: acs-eonerc
+      EXPORT_DIR: /app/exports
+      EXPORT_FLUSH_INTERVAL_S: "30"
+    volumes:
+      - ./fair-bridge/registry:/app/registry:ro
+      - telemetry_exports:/app/exports
+    networks:
+      - ckannet
+      - tbnet
+
+
+  # Device simulators 
+  simulator:
+    build:
+      context: simulator/
+    restart: unless-stopped
+    depends_on:
+      thingsboard:
+        condition: service_started
+    environment:
+      TB_HOST: http://thingsboard:8080
+      TB_MQTT_HOST: thingsboard
+      TB_MQTT_PORT: "1883"
+      TB_USER: tenant@thingsboard.org
+      TB_PASS: tenant
+    volumes:
+      - ./simulator/logs:/app/logs
+    networks:
+      - tbnet
+
+networks:
+  webnet:
+  ckannet:
+  solrnet:
+    internal: true
+  dbnet:
+    internal: true
+  redisnet:
+    internal: true
+  tbnet:

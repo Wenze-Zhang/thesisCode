@@ -1,0 +1,17 @@
+# Kafka consumer/producer
+kafka-python==2.0.2
+
+# CKAN REST API client
+ckanapi==4.7
+
+# JSON Schema validation for ETL pipeline
+jsonschema==4.21.1
+
+# YAML parsing for the canonical field registry (single source of truth)
+PyYAML==6.0.1
+
+# HTTP requests (ThingsBoard REST API)
+requests==2.31.0
+
+# Environment variable loading
+python-dotenv==1.0.0
