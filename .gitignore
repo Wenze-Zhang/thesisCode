@@ -1,4 +1,8 @@
 .env
 .claude/
 .codex/
-
+__pycache__/
+*.py[cod]
+evaluation/results/*
+!evaluation/results/.gitkeep
+docs/
