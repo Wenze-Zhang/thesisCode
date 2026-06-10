@@ -201,20 +201,30 @@ def build_dataset(
     return pkg
 
 
-def upsert_dataset(ckan: RemoteCKAN, pkg: dict) -> None:
+def _patch_dataset(ckan: RemoteCKAN, pkg: dict) -> None:
     slug = pkg["name"]
+    ckan.action.package_patch(
+        id=slug,
+        **{key: value for key, value in pkg.items() if key != "name"},
+    )
+    log.info("Dataset patched: %s", slug)
+
+
+def upsert_dataset(ckan: RemoteCKAN, pkg: dict, *, existing: dict | None = None) -> None:
+    slug = pkg["name"]
+    if existing is not None:
+        _patch_dataset(ckan, pkg)
+        return
+
     try:
         ckan.action.package_create(**pkg)
         log.info("Dataset created: %s", slug)
     except ValidationError as exc:
-        if "name" in (exc.error_dict or {}):
+        if "name" in (getattr(exc, "error_dict", {}) or {}):
             log.info("Dataset %s already exists; patching.", slug)
-            ckan.action.package_patch(
-                id=slug,
-                **{key: value for key, value in pkg.items() if key != "name"},
-            )
+            _patch_dataset(ckan, pkg)
         else:
-            log.warning("Validation error for %s: %s", slug, exc.error_dict)
+            log.warning("Validation error for %s: %s", slug, getattr(exc, "error_dict", {}))
 
 
 def handle_create_or_update(
@@ -229,7 +239,7 @@ def handle_create_or_update(
     existing = _existing_dataset(ckan, slug) if slug else None
     pkg = build_dataset(event, headers, reg=reg, existing=existing, event_type=event_type)
     if pkg is not None:
-        upsert_dataset(ckan, pkg)
+        upsert_dataset(ckan, pkg, existing=existing)
 
 
 def _entity_type(value: dict, headers: dict) -> str:

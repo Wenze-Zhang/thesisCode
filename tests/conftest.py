@@ -117,3 +117,8 @@ def etl_module():
 @pytest.fixture(scope="session")
 def exporter_module():
     return bridge_module("telemetry_exporter")
+
+
+@pytest.fixture(scope="session")
+def enricher_module():
+    return bridge_module("enricher")

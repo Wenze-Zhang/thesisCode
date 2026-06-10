@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""Optional CKAN access check.
+
+This script is not part of the thesis performance evaluation. It measures CKAN
+catalogue/resource access behaviour, not FAIR Bridge telemetry processing.
+"""
 from __future__ import annotations
 
 import argparse
@@ -15,7 +20,7 @@ from urllib.parse import urljoin
 import requests
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RESULTS_DIR = REPO_ROOT / "evaluation" / "results"
 
 RESULT_COLUMNS = [
@@ -46,15 +51,15 @@ def _percentile(values: list[float], percentile: float) -> float | None:
     return round(ordered[lower] * (1 - weight) + ordered[upper] * weight, 6)
 
 
-def _action_url(ckan_url: str, action: str) -> str:
-    return f"{ckan_url.rstrip('/')}/api/action/{action}"
-
-
 def _headers(api_key: str | None) -> dict[str, str]:
-    headers = {"User-Agent": "fair-bridge-evaluation/1.0"}
+    headers = {"User-Agent": "fair-bridge-optional-ckan-access-check/1.0"}
     if api_key:
         headers["Authorization"] = api_key
     return headers
+
+
+def _action_url(ckan_url: str, action: str) -> str:
+    return f"{ckan_url.rstrip('/')}/api/action/{action}"
 
 
 def _request_action(
@@ -79,8 +84,8 @@ def _request_action(
         except ValueError:
             payload = None
         success = response.status_code == 200 and bool(payload and payload.get("success"))
-        error = "" if success else (payload or {}).get("error", response.text[:200])
-        return success, response.status_code, elapsed_ms, payload, str(error)
+        error = "" if success else str((payload or {}).get("error", response.text[:200]))
+        return success, response.status_code, elapsed_ms, payload, error
     except requests.RequestException as exc:
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         return False, None, elapsed_ms, None, str(exc)
@@ -121,19 +126,19 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    summary: dict[str, Any] = {
-        "generated_at": _now_iso(),
-        "operations": {},
-    }
-    operations = sorted({row["operation"] for row in rows})
-    for operation in operations:
+    summary: dict[str, Any] = {"generated_at": _now_iso(), "operations": {}}
+    for operation in sorted({row["operation"] for row in rows}):
         operation_rows = [row for row in rows if row["operation"] == operation]
         successes = [row for row in operation_rows if row["success"]]
         latencies = [float(row["elapsed_ms"]) for row in successes]
         summary["operations"][operation] = {
             "attempts": len(operation_rows),
             "success_count": len(successes),
-            "success_rate": round(len(successes) / len(operation_rows), 6) if operation_rows else None,
+            "success_rate": (
+                round(len(successes) / len(operation_rows), 6)
+                if operation_rows
+                else None
+            ),
             "mean_ms": round(statistics.mean(latencies), 6) if latencies else None,
             "p50_ms": _percentile(latencies, 50),
             "p95_ms": _percentile(latencies, 95),
@@ -206,9 +211,10 @@ def run(args: argparse.Namespace) -> tuple[Path, Path]:
 
     results_dir = args.results_dir
     results_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = results_dir / "ckan_query_latency.csv"
-    summary_path = results_dir / "ckan_query_latency_summary.json"
+    csv_path = results_dir / "optional_ckan_access_check.csv"
+    summary_path = results_dir / "optional_ckan_access_check_summary.json"
     _write_csv(csv_path, rows)
+
     summary = _summarize(rows)
     summary["ckan_url"] = args.ckan_url
     summary["dataset_id"] = args.dataset_id
@@ -225,7 +231,12 @@ def run(args: argparse.Namespace) -> tuple[Path, Path]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Measure CKAN catalogue/resource access latency.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Optional CKAN catalogue/resource access check; not part of the "
+            "main FAIR Bridge performance evaluation."
+        )
+    )
     parser.add_argument("--ckan-url", default="http://localhost:5000")
     parser.add_argument("--dataset-id", default="sensor-example")
     parser.add_argument("--repeat", type=int, default=30)

@@ -5,9 +5,7 @@ import argparse
 import csv
 import json
 import math
-import os
 import random
-import statistics
 import sys
 import time
 from datetime import datetime, timezone
@@ -17,43 +15,23 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FAIR_BRIDGE_DIR = REPO_ROOT / "fair-bridge"
-REGISTRY_PATH = FAIR_BRIDGE_DIR / "registry" / "field_registry.yaml"
 DEFAULT_RESULTS_DIR = REPO_ROOT / "evaluation" / "results"
+DEFAULT_TARGET_ACHIEVED_THRESHOLD = 0.95
+DEFAULT_LIVE_POLL_INTERVAL_S = 0.05
 
 if str(FAIR_BRIDGE_DIR) not in sys.path:
     sys.path.insert(0, str(FAIR_BRIDGE_DIR))
-os.environ.setdefault("REGISTRY_PATH", str(REGISTRY_PATH))
 
 import config  # noqa: E402
-import etl  # noqa: E402
-import registry  # noqa: E402
-
-
-LOCAL_COLUMNS = [
-    "test_id",
-    "mode",
-    "payload_size",
-    "invalid_ratio",
-    "offered_load_msg_s",
-    "duration_s",
-    "produced_count",
-    "validated_count",
-    "dlq_count",
-    "process_error_count",
-    "message_loss_count",
-    "elapsed_s",
-    "throughput_msg_s",
-    "p50_processing_latency_ms",
-    "p95_processing_latency_ms",
-    "p99_processing_latency_ms",
-    "max_processing_latency_ms",
-    "latency_threshold_ms",
-    "benchmark_result_pass_fail",
-]
 
 KAFKA_EVENT_COLUMNS = [
     "test_id",
+    "repetition",
+    "workload",
     "offered_load_msg_s",
+    "device_count",
+    "device_index",
+    "sensor_type",
     "seq",
     "device_id",
     "expected_topic",
@@ -64,6 +42,7 @@ KAFKA_EVENT_COLUMNS = [
     "produced_at",
     "validated_seen_at",
     "dlq_seen_at",
+    "output_seen_at",
     "latency_ms",
 ]
 
@@ -91,6 +70,14 @@ ENUM_SENSOR_TYPES = [
     "ev_charger",
 ]
 
+WORKLOAD_PRESETS = {
+    "small": {"offered_load_msg_s": 10.0, "device_count": 10},
+    "medium": {"offered_load_msg_s": 50.0, "device_count": 50},
+    "big": {"offered_load_msg_s": 100.0, "device_count": 100},
+}
+
+SENSOR_TYPE_CHOICES = [*SENSOR_TYPES, "mixed"]
+
 # parameters into python dict
 def _parse_rates(value: str) -> list[float]:
     rates = []
@@ -106,6 +93,47 @@ def _parse_rates(value: str) -> list[float]:
         raise argparse.ArgumentTypeError("At least one rate is required")
     return rates
 
+
+def _parse_workloads(value: str) -> list[str]:
+    workloads = []
+    for token in value.split(","):
+        workload = token.strip().lower()
+        if not workload:
+            continue
+        if workload not in WORKLOAD_PRESETS:
+            choices = ", ".join(WORKLOAD_PRESETS)
+            raise argparse.ArgumentTypeError(
+                f"Unsupported workload {workload!r}; choose from {choices}"
+            )
+        workloads.append(workload)
+    if not workloads:
+        raise argparse.ArgumentTypeError("At least one workload is required")
+    return workloads
+
+
+def _workload_specs(args: argparse.Namespace) -> list[dict[str, Any]]:
+    if args.rate:
+        device_count = args.device_count or 1
+        if device_count <= 0:
+            raise SystemExit("--device-count must be positive")
+        return [
+            {
+                "workload": f"custom-{_rate_label(rate)}",
+                "offered_load_msg_s": rate,
+                "device_count": device_count,
+            }
+            for rate in _parse_rates(args.rate)
+        ]
+
+    return [
+        {
+            "workload": workload,
+            "offered_load_msg_s": WORKLOAD_PRESETS[workload]["offered_load_msg_s"],
+            "device_count": WORKLOAD_PRESETS[workload]["device_count"],
+        }
+        for workload in _parse_workloads(args.workloads)
+    ]
+
 # 1.5 into 1p5 to put into deviceId or kafka consumer group id
 def _rate_label(rate: float) -> str:
     return str(rate).replace(".", "p")
@@ -120,7 +148,7 @@ def _parse_iso(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-# calcualte p50, p95, p99 percentiles
+# calcualte p50 and p95 percentiles
 def _percentile(values: list[float], percentile: float) -> float | None:
     if not values:
         return None
@@ -134,6 +162,26 @@ def _percentile(values: list[float], percentile: float) -> float | None:
     weight = rank - lower
     return round(ordered[lower] * (1 - weight) + ordered[upper] * weight, 6)
 
+
+def _join_fail_reasons(reasons: list[str]) -> str:
+    return ";".join(dict.fromkeys(reason for reason in reasons if reason))
+
+
+def _is_unexpected_dlq_rate_ok(
+    unexpected_dlq_count: int,
+    expected_validated_count: int,
+    max_unexpected_dlq_rate: float,
+) -> bool:
+    if expected_validated_count <= 0:
+        return unexpected_dlq_count == 0
+    return (unexpected_dlq_count / expected_validated_count) <= max_unexpected_dlq_rate
+
+
+def _safe_rate(numerator: int, denominator: int) -> float | None:
+    if denominator <= 0:
+        return None
+    return round(numerator / denominator, 6)
+
 # payload size padding to increase processing time and message size
 def _padding(payload_size: str) -> str:
     if payload_size == "small":
@@ -145,24 +193,38 @@ def _padding(payload_size: str) -> str:
     raise ValueError(f"Unsupported payload size: {payload_size}")
 
 
-def _invalid_variant_for_seq(seq: int) -> str:
-    return INVALID_VARIANTS[(seq - 1) % len(INVALID_VARIANTS)]
-
-
-def _sensor_type_for_seq(seq: int) -> str:
-    return SENSOR_TYPES[(seq - 1) % len(SENSOR_TYPES)]
-
-
-def _enum_sensor_type_for_seq(seq: int) -> str:
-    return ENUM_SENSOR_TYPES[(seq - 1) % len(ENUM_SENSOR_TYPES)]
+def _invalid_variant_for_seq(seq: int, sensor_type: str) -> str:
+    variants = INVALID_VARIANTS
+    if sensor_type not in ENUM_SENSOR_TYPES:
+        variants = [variant for variant in INVALID_VARIANTS if variant != "invalid_enum"]
+    return variants[(seq - 1) % len(variants)]
 
 
 def _sensor_label(sensor_type: str) -> str:
     return sensor_type.replace("_", "-")
 
 
-def _benchmark_device_name(sensor_type: str, test_id: str) -> str:
-    return f"{_sensor_label(sensor_type)}-benchmark-{test_id}"
+def _sensor_type_for_device(device_index: int, sensor_type_mode: str) -> str:
+    if sensor_type_mode == "mixed":
+        return SENSOR_TYPES[(device_index - 1) % len(SENSOR_TYPES)]
+    return sensor_type_mode
+
+
+def _benchmark_device_name(
+    sensor_type: str,
+    test_id: str,
+    workload: str,
+    device_index: int,
+) -> str:
+    return f"{_sensor_label(sensor_type)}-benchmark-{test_id}-{workload}-{device_index:04d}"
+
+
+def _benchmark_device_id(test_id: str, workload: str, device_index: int) -> str:
+    return f"{test_id}-{workload}-device-{device_index:04d}"
+
+
+def _event_key(device_id: str, ts: str) -> str:
+    return f"{device_id}|{ts}"
 
 
 def _valid_values(sensor_type: str, seq: int) -> dict[str, Any]:
@@ -230,23 +292,20 @@ def _invalid_enum_values(sensor_type: str) -> dict[str, Any]:
 def _synthetic_message(
     *,
     test_id: str,
+    workload: str,
     rate: float,
     seq: int,
+    device_index: int,
+    sensor_type: str,
     valid: bool,
     payload_size: str,
     invalid_variant: str = "",
 ) -> dict[str, Any]:
     sent_at = _now_iso()
-    rate_label = _rate_label(rate)
-    variant = "" if valid else (invalid_variant or _invalid_variant_for_seq(seq))
-    sensor_type = (
-        _enum_sensor_type_for_seq(seq)
-        if variant == "invalid_enum"
-        else _sensor_type_for_seq(seq)
-    )
+    variant = "" if valid else (invalid_variant or _invalid_variant_for_seq(seq, sensor_type))
     message = {
-        "deviceName": _benchmark_device_name(sensor_type, test_id),
-        "deviceId": f"{test_id}-{rate_label}-{_sensor_label(sensor_type)}-{seq:06d}",
+        "deviceName": _benchmark_device_name(sensor_type, test_id, workload, device_index),
+        "deviceId": _benchmark_device_id(test_id, workload, device_index),
         "ts": sent_at,
     }
 
@@ -280,7 +339,9 @@ def _synthetic_message(
     # keep the raw payload minimal so etl.py reports the intended error.
     if "values" in message:
         message["test_id"] = test_id
+        message["workload"] = workload
         message["seq"] = seq
+        message["device_index"] = device_index
         message["sent_at"] = sent_at
         padding = _padding(payload_size)
         if padding:
@@ -294,94 +355,9 @@ def _write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) ->
     
     # with is file mangaer. After use, file is closed automatically 
     with path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
-
-# test etl without kafka
-def run_local_etl(args: argparse.Namespace) -> Path:
-    reg = registry.load_registry(str(REGISTRY_PATH))
-    rng = random.Random(args.seed)
-    rows = []
-
-    # different rates
-    for rate in args.rates:
-        produced_count = max(1, int(rate * args.duration_s))
-        validated_count = 0
-        dlq_count = 0
-        process_error_count = 0
-        latencies_ms: list[float] = []
-        start = time.perf_counter()
-        invalid_seq = 0
-
-        # generate testing messages
-        for seq in range(1, produced_count + 1):
-            valid = rng.random() >= args.invalid_ratio
-            invalid_variant = ""
-            if not valid:
-                invalid_seq += 1
-                invalid_variant = _invalid_variant_for_seq(invalid_seq)
-            msg = _synthetic_message(
-                test_id=args.test_id,
-                rate=rate,
-                seq=seq,
-                valid=valid,
-                payload_size=args.payload_size,
-                invalid_variant=invalid_variant,
-            )
-            
-            before = time.perf_counter_ns()
-            
-            try:
-                topic, _payload = etl.process_message(msg, {}, reg=reg)
-            except Exception:
-                process_error_count += 1
-                continue
-            after = time.perf_counter_ns()
-            latencies_ms.append((after - before) / 1_000_000)
-            if topic == config.KAFKA_TOPIC_TELEMETRY_VALIDATED:
-                validated_count += 1
-            elif topic == config.KAFKA_TOPIC_DLQ:
-                dlq_count += 1
-
-        elapsed_s = max(time.perf_counter() - start, 0.000001)
-        message_loss_count = produced_count - validated_count - dlq_count
-        p95 = _percentile(latencies_ms, 95) or 0.0
-        passed = (
-            message_loss_count == 0
-            and process_error_count == 0
-            and p95 <= args.latency_threshold_ms
-        )
-
-        rows.append(
-            {
-                "test_id": args.test_id,
-                "mode": "local-etl",
-                "payload_size": args.payload_size,
-                "invalid_ratio": args.invalid_ratio,
-                "offered_load_msg_s": rate,
-                "duration_s": args.duration_s,
-                "produced_count": produced_count,
-                "validated_count": validated_count,
-                "dlq_count": dlq_count,
-                "process_error_count": process_error_count,
-                "message_loss_count": message_loss_count,
-                "elapsed_s": round(elapsed_s, 6),
-                "throughput_msg_s": round(produced_count / elapsed_s, 6),
-                "p50_processing_latency_ms": _percentile(latencies_ms, 50),
-                "p95_processing_latency_ms": p95,
-                "p99_processing_latency_ms": _percentile(latencies_ms, 99),
-                "max_processing_latency_ms": round(max(latencies_ms), 6) if latencies_ms else None,
-                "latency_threshold_ms": args.latency_threshold_ms,
-                "benchmark_result_pass_fail": "pass" if passed else "fail",
-            }
-        )
-
-    # Benchmark results are written here so thesis figures can be reproduced.
-    output_path = args.results_dir / "local_etl_benchmark.csv"
-    _write_csv(output_path, LOCAL_COLUMNS, rows)
-    print(f"Wrote {output_path}")
-    return output_path
 
 
 def _import_kafka_clients():
@@ -411,93 +387,240 @@ def _make_consumer(KafkaConsumer, topic: str, group_id: str, bootstrap_server: s
     return consumer
 
 # poll messages from validated and dlq topics
-def _collect_outputs(consumer, topic: str, events: dict[str, dict[str, Any]]) -> int:
+def _collect_outputs(
+    consumer,
+    topic: str,
+    events: dict[str, dict[str, Any]],
+    *,
+    timeout_ms: int = 0,
+    max_records: int = 500,
+) -> int:
     seen = 0
-    polled = consumer.poll(timeout_ms=250, max_records=500)
+    polled = consumer.poll(timeout_ms=timeout_ms, max_records=max_records)
     seen_at = _now_iso()
+    seen_perf = time.perf_counter()
     for batch in polled.values():
         for record in batch:
             payload = record.value or {}
             device_id = payload.get("device_id") or payload.get("deviceId")
-            if device_id not in events:
+            ts = payload.get("ts") or payload.get("timestamp") or ""
+            event_key = _event_key(str(device_id), str(ts))
+            if event_key not in events:
                 continue
-            event = events[device_id]
+            event = events[event_key]
             if topic == config.KAFKA_TOPIC_TELEMETRY_VALIDATED:
                 if event.get("validated_seen_at"):
                     continue
                 event["validated_seen_at"] = seen_at
-                event["actual_topic"] = config.KAFKA_TOPIC_TELEMETRY_VALIDATED
             else:
                 if event.get("dlq_seen_at"):
                     continue
                 event["dlq_seen_at"] = seen_at
-                event["actual_topic"] = config.KAFKA_TOPIC_DLQ
-            try:
-                # latency calculation 
-                event["latency_ms"] = round(
-                    (_parse_iso(seen_at) - _parse_iso(event["sent_at"])).total_seconds() * 1000.0,
-                    6,
-                )
-            except Exception:
-                event["latency_ms"] = None
+            if not event.get("output_seen_at"):
+                event["output_seen_at"] = seen_at
+                event["actual_topic"] = topic
+                try:
+                    # latency calculation
+                    sent_perf = event.get("sent_perf")
+                    if sent_perf is not None:
+                        latency_s = seen_perf - float(sent_perf)
+                    else:
+                        latency_s = (
+                            _parse_iso(seen_at) - _parse_iso(event["sent_at"])
+                        ).total_seconds()
+                    event["latency_ms"] = round(latency_s * 1000.0, 6)
+                except Exception:
+                    event["latency_ms"] = None
+            elif event.get("actual_topic") not in ("", topic, "multiple"):
+                event["actual_topic"] = "multiple"
             seen += 1
     return seen
 
 
-def _check_export_csv(results_export_dir: Path, test_id: str) -> bool | None:
-    if not results_export_dir.exists():
-        return None
-    pattern = f"sensor-*-benchmark-{test_id}/*.csv"
-    return any(results_export_dir.glob(pattern))
+def _collect_kafka_outputs(
+    validated_consumer,
+    dlq_consumer,
+    events: dict[str, dict[str, Any]],
+    *,
+    timeout_ms: int = 0,
+) -> int:
+    seen = 0
+    seen += _collect_outputs(
+        validated_consumer,
+        config.KAFKA_TOPIC_TELEMETRY_VALIDATED,
+        events,
+        timeout_ms=timeout_ms,
+    )
+    seen += _collect_outputs(
+        dlq_consumer,
+        config.KAFKA_TOPIC_DLQ,
+        events,
+        timeout_ms=timeout_ms,
+    )
+    return seen
+
+
+def _sleep_with_output_collection(
+    *,
+    until_perf: float,
+    poll_interval_s: float,
+    validated_consumer,
+    dlq_consumer,
+    events: dict[str, dict[str, Any]],
+) -> None:
+    while True:
+        remaining_s = until_perf - time.perf_counter()
+        if remaining_s <= 0:
+            return
+        _collect_kafka_outputs(
+            validated_consumer,
+            dlq_consumer,
+            events,
+            timeout_ms=0,
+        )
+        sleep_s = min(remaining_s, max(poll_interval_s, 0.001))
+        if sleep_s > 0:
+            time.sleep(sleep_s)
 
 
 def _summarize_kafka_run(
     *,
     args: argparse.Namespace,
+    repetition: int,
+    workload: str,
     rate: float,
+    device_count: int,
     events: dict[str, dict[str, Any]],
     produce_elapsed_s: float,
 ) -> dict[str, Any]:
     produced_count = len(events)
     validated_count = sum(1 for event in events.values() if event.get("validated_seen_at"))
     dlq_count = sum(1 for event in events.values() if event.get("dlq_seen_at"))
-    output_count = validated_count + dlq_count
-    message_loss_count = produced_count - output_count
-    validated_latencies = [
+    etl_output_count = validated_count + dlq_count
+    message_loss_count = produced_count - etl_output_count
+    expected_validated_count = sum(
+        1
+        for event in events.values()
+        if event.get("expected_topic") == config.KAFKA_TOPIC_TELEMETRY_VALIDATED
+    )
+    expected_dlq_count = sum(
+        1
+        for event in events.values()
+        if event.get("expected_topic") == config.KAFKA_TOPIC_DLQ
+    )
+    unexpected_dlq_count = sum(
+        1
+        for event in events.values()
+        if event.get("expected_topic") == config.KAFKA_TOPIC_TELEMETRY_VALIDATED
+        and event.get("dlq_seen_at")
+    )
+    unexpected_validated_count = sum(
+        1
+        for event in events.values()
+        if event.get("expected_topic") == config.KAFKA_TOPIC_DLQ
+        and event.get("validated_seen_at")
+    )
+    misrouted_count = unexpected_dlq_count + unexpected_validated_count
+    correctly_routed_count = sum(
+        1
+        for event in events.values()
+        if event.get("actual_topic") == event.get("expected_topic")
+    )
+    observed_backlog_after_cooldown_count = message_loss_count
+    produced_throughput_msg_s = round(
+        produced_count / max(produce_elapsed_s, 0.000001),
+        6,
+    )
+    target_achieved_ratio = (
+        round(produced_throughput_msg_s / rate, 6)
+        if rate > 0
+        else None
+    )
+    fast_path_latencies = [
         float(event["latency_ms"])
         for event in events.values()
-        if event.get("validated_seen_at") and event.get("latency_ms") is not None
+        if event.get("output_seen_at") and event.get("latency_ms") is not None
     ]
-    p95 = _percentile(validated_latencies, 95)
-    passed = (
-        message_loss_count == 0
-        and output_count == produced_count
-        and (p95 is None or p95 <= args.latency_threshold_ms)
+    p95 = _percentile(fast_path_latencies, 95)
+    unexpected_dlq_rate = (
+        round(unexpected_dlq_count / expected_validated_count, 6)
+        if expected_validated_count
+        else 0.0
     )
+    fail_reasons: list[str] = []
+    if observed_backlog_after_cooldown_count != 0:
+        fail_reasons.append("observed_backlog_after_cooldown")
+    elif message_loss_count != 0:
+        fail_reasons.append("message_loss")
+    if misrouted_count != 0:
+        fail_reasons.append("misrouted_message")
+    if p95 is None or p95 > args.latency_threshold_ms:
+        fail_reasons.append("p95_latency_above_threshold")
+    if not _is_unexpected_dlq_rate_ok(
+        unexpected_dlq_count,
+        expected_validated_count,
+        args.max_unexpected_dlq_rate,
+    ):
+        fail_reasons.append("unexpected_dlq_rate_above_threshold")
+    if (
+        target_achieved_ratio is None
+        or target_achieved_ratio < args.target_achieved_threshold
+    ):
+        fail_reasons.append("target_load_not_achieved")
+    passed = not fail_reasons
 
     return {
         "test_id": args.test_id,
+        "repetition": repetition,
+        "workload": workload,
         "mode": "kafka-e2e",
         "payload_size": args.payload_size,
+        "sensor_type": args.sensor_type,
         "invalid_ratio": args.invalid_ratio,
         "offered_load_msg_s": rate,
+        "device_count": device_count,
+        "per_device_rate_msg_s": round(rate / device_count, 6) if device_count else None,
         "duration_s": args.duration_s,
+        "produce_elapsed_s": round(produce_elapsed_s, 6),
+        "target_produced_count": round(rate * args.duration_s),
         "produced_count": produced_count,
+        "produced_throughput_msg_s": produced_throughput_msg_s,
+        "target_achieved_ratio": target_achieved_ratio,
+        "target_achieved_threshold": args.target_achieved_threshold,
         "validated_count": validated_count,
         "dlq_count": dlq_count,
-        "output_rate_msg_s": round(output_count / max(produce_elapsed_s, 0.000001), 6),
-        "message_loss_count": message_loss_count,
-        "p50_raw_to_validated_latency_ms": _percentile(validated_latencies, 50),
-        "p95_raw_to_validated_latency_ms": p95,
-        "p99_raw_to_validated_latency_ms": _percentile(validated_latencies, 99),
-        "max_latency_ms": round(max(validated_latencies), 6) if validated_latencies else None,
-        "latency_threshold_ms": args.latency_threshold_ms,
-        "benchmark_result_pass_fail": "pass" if passed else "fail",
-        "csv_file_seen": (
-            _check_export_csv(args.export_dir, args.test_id)
-            if args.check_export_dir
-            else None
+        "etl_output_count": etl_output_count,
+        "etl_output_throughput_msg_s": round(
+            etl_output_count / max(produce_elapsed_s, 0.000001),
+            6,
         ),
+        "message_loss_count": message_loss_count,
+        "expected_validated_count": expected_validated_count,
+        "expected_dlq_count": expected_dlq_count,
+        "unexpected_dlq_count": unexpected_dlq_count,
+        "unexpected_dlq_rate": unexpected_dlq_rate,
+        "max_unexpected_dlq_rate": args.max_unexpected_dlq_rate,
+        "unexpected_validated_count": unexpected_validated_count,
+        "misrouted_count": misrouted_count,
+        "valid_acceptance_rate": _safe_rate(
+            expected_validated_count - unexpected_dlq_count,
+            expected_validated_count,
+        ),
+        "invalid_rejection_rate": _safe_rate(
+            expected_dlq_count - unexpected_validated_count,
+            expected_dlq_count,
+        ),
+        "routing_success_rate": _safe_rate(correctly_routed_count, produced_count),
+        "observed_backlog_after_cooldown_count": observed_backlog_after_cooldown_count,
+        "cooldown_s": args.cooldown_s,
+        "p50_fast_path_latency_ms": _percentile(fast_path_latencies, 50),
+        "p95_fast_path_latency_ms": p95,
+        "max_fast_path_latency_ms": (
+            round(max(fast_path_latencies), 6) if fast_path_latencies else None
+        ),
+        "latency_threshold_ms": args.latency_threshold_ms,
+        "fail_reason": _join_fail_reasons(fail_reasons),
+        "benchmark_result_pass_fail": "pass" if passed else "fail",
     }
 
 # run through etl with kafka
@@ -514,98 +637,144 @@ def run_kafka_e2e(args: argparse.Namespace) -> tuple[Path, Path]:
     summaries: list[dict[str, Any]] = []
 
     try:
-        for rate in args.rates:
-            rate_label = _rate_label(rate)
-            validated_consumer = _make_consumer(
-                KafkaConsumer,
-                config.KAFKA_TOPIC_TELEMETRY_VALIDATED,
-                f"eval-{args.test_id}-{rate_label}-validated-{int(time.time())}",
-                args.bootstrap_server,
-            )
-            dlq_consumer = _make_consumer(
-                KafkaConsumer,
-                config.KAFKA_TOPIC_DLQ,
-                f"eval-{args.test_id}-{rate_label}-dlq-{int(time.time())}",
-                args.bootstrap_server,
-            )
-            events: dict[str, dict[str, Any]] = {}
-            seq = 0
-            invalid_seq = 0
-            start = time.perf_counter()
-            next_send = start
-            deadline = start + args.duration_s
-
-            while time.perf_counter() < deadline:
-                seq += 1
-                valid = rng.random() >= args.invalid_ratio
-                invalid_variant = ""
-                if not valid:
-                    invalid_seq += 1
-                    invalid_variant = _invalid_variant_for_seq(invalid_seq)
-                msg = _synthetic_message(
-                    test_id=args.test_id,
-                    rate=rate,
-                    seq=seq,
-                    valid=valid,
-                    payload_size=args.payload_size,
-                    invalid_variant=invalid_variant,
+        for repetition in range(1, args.repeat + 1):
+            for workload_spec in args.workload_specs:
+                workload = workload_spec["workload"]
+                rate = float(workload_spec["offered_load_msg_s"])
+                device_count = int(workload_spec["device_count"])
+                rate_label = _rate_label(rate)
+                group_suffix = f"{workload}-{repetition}-{time.time_ns()}"
+                validated_consumer = _make_consumer(
+                    KafkaConsumer,
+                    config.KAFKA_TOPIC_TELEMETRY_VALIDATED,
+                    f"eval-{args.test_id}-{rate_label}-validated-{group_suffix}",
+                    args.bootstrap_server,
                 )
-                device_id = msg["deviceId"]
-                sent_at = msg.get("sent_at") or msg["ts"]
-                expected_topic = (
-                    config.KAFKA_TOPIC_TELEMETRY_VALIDATED
-                    if valid
-                    else config.KAFKA_TOPIC_DLQ
+                dlq_consumer = _make_consumer(
+                    KafkaConsumer,
+                    config.KAFKA_TOPIC_DLQ,
+                    f"eval-{args.test_id}-{rate_label}-dlq-{group_suffix}",
+                    args.bootstrap_server,
                 )
-                producer.send(config.KAFKA_TOPIC_TELEMETRY_RAW, msg).get(timeout=10)
-                produced_at = _now_iso()
-                events[device_id] = {
-                    "test_id": args.test_id,
-                    "offered_load_msg_s": rate,
-                    "seq": seq,
-                    "device_id": device_id,
-                    "expected_topic": expected_topic,
-                    "actual_topic": "",
-                    "payload_valid": valid,
-                    "invalid_variant": invalid_variant,
-                    "sent_at": sent_at,
-                    "produced_at": produced_at,
-                    "validated_seen_at": "",
-                    "dlq_seen_at": "",
-                    "latency_ms": "",
-                }
+                events: dict[str, dict[str, Any]] = {}
+                send_futures: list[tuple[dict[str, Any], Any]] = []
+                seq = 0
+                invalid_seq = 0
+                start = time.perf_counter()
+                next_send = start
+                deadline = start + args.duration_s
+                benchmark_test_id = f"{args.test_id}-r{repetition}"
 
-                _collect_outputs(validated_consumer, config.KAFKA_TOPIC_TELEMETRY_VALIDATED, events)
-                _collect_outputs(dlq_consumer, config.KAFKA_TOPIC_DLQ, events)
+                while time.perf_counter() < deadline:
+                    seq += 1
+                    device_index = ((seq - 1) % device_count) + 1
+                    sensor_type = _sensor_type_for_device(device_index, args.sensor_type)
+                    valid = rng.random() >= args.invalid_ratio
+                    invalid_variant = ""
+                    if not valid:
+                        invalid_seq += 1
+                        invalid_variant = _invalid_variant_for_seq(invalid_seq, sensor_type)
+                    sent_perf = time.perf_counter()
+                    msg = _synthetic_message(
+                        test_id=benchmark_test_id,
+                        workload=workload,
+                        rate=rate,
+                        seq=seq,
+                        device_index=device_index,
+                        sensor_type=sensor_type,
+                        valid=valid,
+                        payload_size=args.payload_size,
+                        invalid_variant=invalid_variant,
+                    )
+                    device_id = msg["deviceId"]
+                    sent_at = msg.get("sent_at") or msg["ts"]
+                    event_key = _event_key(str(device_id), str(sent_at))
+                    expected_topic = (
+                        config.KAFKA_TOPIC_TELEMETRY_VALIDATED
+                        if valid
+                        else config.KAFKA_TOPIC_DLQ
+                    )
+                    event = {
+                        "test_id": args.test_id,
+                        "repetition": repetition,
+                        "workload": workload,
+                        "offered_load_msg_s": rate,
+                        "device_count": device_count,
+                        "device_index": device_index,
+                        "sensor_type": sensor_type,
+                        "seq": seq,
+                        "device_id": device_id,
+                        "expected_topic": expected_topic,
+                        "actual_topic": "",
+                        "payload_valid": valid,
+                        "invalid_variant": invalid_variant,
+                        "sent_at": sent_at,
+                        "sent_perf": sent_perf,
+                        "produced_at": "",
+                        "validated_seen_at": "",
+                        "dlq_seen_at": "",
+                        "output_seen_at": "",
+                        "latency_ms": "",
+                    }
+                    events[event_key] = event
+                    future = producer.send(config.KAFKA_TOPIC_TELEMETRY_RAW, msg)
+                    future.add_callback(
+                        lambda _metadata, event=event: event.__setitem__(
+                            "produced_at",
+                            _now_iso(),
+                        )
+                    )
+                    send_futures.append((event, future))
 
-                next_send += 1.0 / rate
-                sleep_s = next_send - time.perf_counter()
-                if sleep_s > 0:
-                    time.sleep(sleep_s)
+                    _collect_kafka_outputs(
+                        validated_consumer,
+                        dlq_consumer,
+                        events,
+                        timeout_ms=0,
+                    )
 
-            producer.flush()
-            produce_elapsed_s = max(time.perf_counter() - start, 0.000001)
-            output_deadline = time.time() + args.cooldown_s
-            while time.time() < output_deadline:
-                seen = 0
-                seen += _collect_outputs(validated_consumer, config.KAFKA_TOPIC_TELEMETRY_VALIDATED, events)
-                seen += _collect_outputs(dlq_consumer, config.KAFKA_TOPIC_DLQ, events)
-                if sum(1 for event in events.values() if event.get("actual_topic")) == len(events):
-                    break
-                if seen == 0:
-                    time.sleep(0.25)
+                    next_send += 1.0 / rate
+                    _sleep_with_output_collection(
+                        until_perf=next_send,
+                        poll_interval_s=args.live_poll_interval_s,
+                        validated_consumer=validated_consumer,
+                        dlq_consumer=dlq_consumer,
+                        events=events,
+                    )
 
-            summaries.append(
-                _summarize_kafka_run(
-                    args=args,
-                    rate=rate,
-                    events=events,
-                    produce_elapsed_s=produce_elapsed_s,
+                producer.flush(timeout=10)
+                for event, future in send_futures:
+                    future.get(timeout=10)
+                    if not event.get("produced_at"):
+                        event["produced_at"] = _now_iso()
+                produce_elapsed_s = max(time.perf_counter() - start, 0.000001)
+                output_deadline = time.time() + args.cooldown_s
+                while time.time() < output_deadline:
+                    seen = _collect_kafka_outputs(
+                        validated_consumer,
+                        dlq_consumer,
+                        events,
+                        timeout_ms=250,
+                    )
+                    if sum(1 for event in events.values() if event.get("actual_topic")) == len(events):
+                        break
+                    if seen == 0:
+                        time.sleep(0.25)
+
+                summaries.append(
+                    _summarize_kafka_run(
+                        args=args,
+                        repetition=repetition,
+                        workload=workload,
+                        rate=rate,
+                        device_count=device_count,
+                        events=events,
+                        produce_elapsed_s=produce_elapsed_s,
+                    )
                 )
-            )
-            all_events.extend(events.values())
-            validated_consumer.close()
-            dlq_consumer.close()
+                all_events.extend(events.values())
+                validated_consumer.close()
+                dlq_consumer.close()
     finally:
         producer.close()
 
@@ -619,6 +788,13 @@ def run_kafka_e2e(args: argparse.Namespace) -> tuple[Path, Path]:
         "raw_topic": config.KAFKA_TOPIC_TELEMETRY_RAW,
         "validated_topic": config.KAFKA_TOPIC_TELEMETRY_VALIDATED,
         "dlq_topic": config.KAFKA_TOPIC_DLQ,
+        "repeat": args.repeat,
+        "latency_threshold_ms": args.latency_threshold_ms,
+        "max_unexpected_dlq_rate": args.max_unexpected_dlq_rate,
+        "target_achieved_threshold": args.target_achieved_threshold,
+        "cooldown_s": args.cooldown_s,
+        "workloads": args.workload_specs,
+        "sensor_type": args.sensor_type,
         "runs": summaries,
     }
     summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -629,33 +805,67 @@ def run_kafka_e2e(args: argparse.Namespace) -> tuple[Path, Path]:
     print(f"Wrote {summary_path}")
     return events_path, summary_path
 
-
+# CLI parameters
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run FAIR Bridge performance benchmarks.")
-    parser.add_argument("--mode", choices=["local-etl", "kafka-e2e"], required=True)
-    parser.add_argument("--rate", default="1,5,10,25,50", help="Comma-separated offered load values.")
+    parser = argparse.ArgumentParser(
+        description="Run the FAIR Bridge Kafka E2E performance benchmark."
+    )
+    parser.add_argument(
+        "--workloads",
+        default="small,medium,big",
+        help="Comma-separated workload presets: small,medium,big.",
+    )
+    parser.add_argument(
+        "--rate",
+        default=None,
+        help="Optional comma-separated offered load override. When set, --workloads is ignored.",
+    )
+    parser.add_argument(
+        "--device-count",
+        type=int,
+        default=None,
+        help="Device count for custom --rate workloads.",
+    )
     parser.add_argument("--duration-s", type=int, default=300)
     parser.add_argument("--payload-size", choices=["small", "medium", "large"], default="small")
-    parser.add_argument("--invalid-ratio", type=float, default=0.0)
+    parser.add_argument("--sensor-type", choices=SENSOR_TYPE_CHOICES, default="climate")
+    parser.add_argument("--invalid-ratio", type=float, default=0.2)
+    parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--test-id", default="perf-run-001")
-    parser.add_argument("--bootstrap-server", default="localhost:9092")
+    parser.add_argument("--bootstrap-server", default=config.KAFKA_BOOTSTRAP_SERVERS)
     parser.add_argument("--cooldown-s", type=int, default=30)
     parser.add_argument("--latency-threshold-ms", type=float, default=1000.0)
+    parser.add_argument("--max-unexpected-dlq-rate", type=float, default=0.01)
+    parser.add_argument(
+        "--target-achieved-threshold",
+        type=float,
+        default=DEFAULT_TARGET_ACHIEVED_THRESHOLD,
+        help="Minimum produced throughput / offered load ratio required to count the run as pass.",
+    )
+    parser.add_argument(
+        "--live-poll-interval-s",
+        type=float,
+        default=DEFAULT_LIVE_POLL_INTERVAL_S,
+        help="Maximum interval between non-blocking output polls while generating load.",
+    )
     parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--check-export-dir", action="store_true")
-    parser.add_argument("--export-dir", type=Path, default=Path(config.EXPORT_DIR))
     args = parser.parse_args()
 
     if not 0.0 <= args.invalid_ratio <= 1.0:
         raise SystemExit("--invalid-ratio must be between 0.0 and 1.0")
-    args.rates = _parse_rates(args.rate)
+    if args.repeat <= 0:
+        raise SystemExit("--repeat must be positive")
+    if not 0.0 <= args.max_unexpected_dlq_rate <= 1.0:
+        raise SystemExit("--max-unexpected-dlq-rate must be between 0.0 and 1.0")
+    if not 0.0 <= args.target_achieved_threshold <= 1.0:
+        raise SystemExit("--target-achieved-threshold must be between 0.0 and 1.0")
+    if args.live_poll_interval_s < 0.0:
+        raise SystemExit("--live-poll-interval-s must be non-negative")
+    args.workload_specs = _workload_specs(args)
     args.results_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.mode == "local-etl":
-        run_local_etl(args)
-    else:
-        run_kafka_e2e(args)
+    run_kafka_e2e(args)
     return 0
 
 
