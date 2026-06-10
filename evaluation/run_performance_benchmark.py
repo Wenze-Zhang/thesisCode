@@ -59,11 +59,36 @@ KAFKA_EVENT_COLUMNS = [
     "expected_topic",
     "actual_topic",
     "payload_valid",
+    "invalid_variant",
     "sent_at",
     "produced_at",
     "validated_seen_at",
     "dlq_seen_at",
     "latency_ms",
+]
+
+INVALID_VARIANTS = [
+    "out_of_range",
+    "wrong_datatype",
+    "unknown_field",
+    "missing_values",
+    "non_dict_values",
+    "invalid_enum",
+    "unknown_sensor_type",
+]
+
+SENSOR_TYPES = [
+    "climate",
+    "energy",
+    "water",
+    "air_quality",
+    "ev_charger",
+]
+
+ENUM_SENSOR_TYPES = [
+    "climate",
+    "energy",
+    "ev_charger",
 ]
 
 # parameters into python dict
@@ -120,6 +145,87 @@ def _padding(payload_size: str) -> str:
     raise ValueError(f"Unsupported payload size: {payload_size}")
 
 
+def _invalid_variant_for_seq(seq: int) -> str:
+    return INVALID_VARIANTS[(seq - 1) % len(INVALID_VARIANTS)]
+
+
+def _sensor_type_for_seq(seq: int) -> str:
+    return SENSOR_TYPES[(seq - 1) % len(SENSOR_TYPES)]
+
+
+def _enum_sensor_type_for_seq(seq: int) -> str:
+    return ENUM_SENSOR_TYPES[(seq - 1) % len(ENUM_SENSOR_TYPES)]
+
+
+def _sensor_label(sensor_type: str) -> str:
+    return sensor_type.replace("_", "-")
+
+
+def _benchmark_device_name(sensor_type: str, test_id: str) -> str:
+    return f"{_sensor_label(sensor_type)}-benchmark-{test_id}"
+
+
+def _valid_values(sensor_type: str, seq: int) -> dict[str, Any]:
+    if sensor_type == "climate":
+        return {
+            "temperature_c": round(20.0 + (seq % 100) / 10.0, 2),
+            "humidity_pct": round(40.0 + (seq % 50) / 2.0, 2),
+        }
+    if sensor_type == "energy":
+        return {
+            "power_w": round(500.0 + (seq % 100) * 25.0, 3),
+            "voltage_v": round(220.0 + (seq % 20), 3),
+        }
+    if sensor_type == "water":
+        return {
+            "flow_lpm": round(5.0 + (seq % 100) * 2.0, 3),
+            "pressure_bar": round(1.0 + (seq % 20) / 2.0, 3),
+        }
+    if sensor_type == "air_quality":
+        return {
+            "pm2_5_ugm3": round(5.0 + (seq % 100) * 1.5, 3),
+            "aqi": seq % 300,
+        }
+    if sensor_type == "ev_charger":
+        states = ["idle", "charging", "complete", "fault"]
+        return {
+            "state": states[seq % len(states)],
+            "power_kw": round((seq % 50) * 2.5, 3),
+        }
+    raise ValueError(f"Unsupported sensor type: {sensor_type}")
+
+
+def _out_of_range_values(sensor_type: str) -> dict[str, Any]:
+    values = {
+        "climate": {"temperature_c": 999.0},
+        "energy": {"power_w": 100_001.0},
+        "water": {"flow_lpm": 5_001.0},
+        "air_quality": {"pm2_5_ugm3": 1_001.0},
+        "ev_charger": {"power_kw": 351.0},
+    }
+    return values[sensor_type]
+
+
+def _wrong_datatype_values(sensor_type: str) -> dict[str, Any]:
+    values = {
+        "climate": {"temperature_c": "not-a-number"},
+        "energy": {"power_w": "not-a-number"},
+        "water": {"leak_detected": "false"},
+        "air_quality": {"aqi": "not-an-integer"},
+        "ev_charger": {"power_kw": "not-a-number"},
+    }
+    return values[sensor_type]
+
+
+def _invalid_enum_values(sensor_type: str) -> dict[str, Any]:
+    values = {
+        "climate": {"hvac_state": "running"},
+        "energy": {"phase": "4P"},
+        "ev_charger": {"state": "paused"},
+    }
+    return values[sensor_type]
+
+
 # generate messages for testing with valid or invalid values
 def _synthetic_message(
     *,
@@ -128,29 +234,57 @@ def _synthetic_message(
     seq: int,
     valid: bool,
     payload_size: str,
+    invalid_variant: str = "",
 ) -> dict[str, Any]:
     sent_at = _now_iso()
     rate_label = _rate_label(rate)
-    values = (
-        {
-            "temperature_c": round(20.0 + (seq % 100) / 10.0, 2),
-            "humidity_pct": round(40.0 + (seq % 50) / 2.0, 2),
-        }
-        if valid
-        else {"temperature_c": 999.0}
+    variant = "" if valid else (invalid_variant or _invalid_variant_for_seq(seq))
+    sensor_type = (
+        _enum_sensor_type_for_seq(seq)
+        if variant == "invalid_enum"
+        else _sensor_type_for_seq(seq)
     )
     message = {
-        "deviceName": f"climate-benchmark-{test_id}",
-        "deviceId": f"{test_id}-{rate_label}-{seq:06d}",
+        "deviceName": _benchmark_device_name(sensor_type, test_id),
+        "deviceId": f"{test_id}-{rate_label}-{_sensor_label(sensor_type)}-{seq:06d}",
         "ts": sent_at,
-        "values": values,
-        "test_id": test_id,
-        "seq": seq,
-        "sent_at": sent_at,
     }
-    padding = _padding(payload_size)
-    if padding:
-        message["padding"] = padding
+
+    if valid:
+        values: Any = _valid_values(sensor_type, seq)
+        message["values"] = values
+    else:
+        if variant == "out_of_range":
+            values = _out_of_range_values(sensor_type)
+        elif variant == "wrong_datatype":
+            values = _wrong_datatype_values(sensor_type)
+        elif variant == "unknown_field":
+            values = _valid_values(sensor_type, seq)
+            values["unknown_benchmark_field"] = 1
+        elif variant == "missing_values":
+            values = None
+        elif variant == "non_dict_values":
+            values = ["not", "an", "object"]
+        elif variant == "invalid_enum":
+            values = _invalid_enum_values(sensor_type)
+        elif variant == "unknown_sensor_type":
+            message["deviceName"] = f"unknown-benchmark-{test_id}"
+            values = _valid_values("climate", seq)
+        else:
+            raise ValueError(f"Unsupported invalid variant: {variant}")
+
+        if variant != "missing_values":
+            message["values"] = values
+
+    # Extra benchmark metadata is safe when values exists. For missing_values,
+    # keep the raw payload minimal so etl.py reports the intended error.
+    if "values" in message:
+        message["test_id"] = test_id
+        message["seq"] = seq
+        message["sent_at"] = sent_at
+        padding = _padding(payload_size)
+        if padding:
+            message["padding"] = padding
     return message
 
 
@@ -178,16 +312,22 @@ def run_local_etl(args: argparse.Namespace) -> Path:
         process_error_count = 0
         latencies_ms: list[float] = []
         start = time.perf_counter()
+        invalid_seq = 0
 
         # generate testing messages
         for seq in range(1, produced_count + 1):
             valid = rng.random() >= args.invalid_ratio
+            invalid_variant = ""
+            if not valid:
+                invalid_seq += 1
+                invalid_variant = _invalid_variant_for_seq(invalid_seq)
             msg = _synthetic_message(
                 test_id=args.test_id,
                 rate=rate,
                 seq=seq,
                 valid=valid,
                 payload_size=args.payload_size,
+                invalid_variant=invalid_variant,
             )
             
             before = time.perf_counter_ns()
@@ -307,7 +447,7 @@ def _collect_outputs(consumer, topic: str, events: dict[str, dict[str, Any]]) ->
 def _check_export_csv(results_export_dir: Path, test_id: str) -> bool | None:
     if not results_export_dir.exists():
         return None
-    pattern = f"sensor-climate-benchmark-{test_id}/*.csv"
+    pattern = f"sensor-*-benchmark-{test_id}/*.csv"
     return any(results_export_dir.glob(pattern))
 
 
@@ -390,6 +530,7 @@ def run_kafka_e2e(args: argparse.Namespace) -> tuple[Path, Path]:
             )
             events: dict[str, dict[str, Any]] = {}
             seq = 0
+            invalid_seq = 0
             start = time.perf_counter()
             next_send = start
             deadline = start + args.duration_s
@@ -397,14 +538,20 @@ def run_kafka_e2e(args: argparse.Namespace) -> tuple[Path, Path]:
             while time.perf_counter() < deadline:
                 seq += 1
                 valid = rng.random() >= args.invalid_ratio
+                invalid_variant = ""
+                if not valid:
+                    invalid_seq += 1
+                    invalid_variant = _invalid_variant_for_seq(invalid_seq)
                 msg = _synthetic_message(
                     test_id=args.test_id,
                     rate=rate,
                     seq=seq,
                     valid=valid,
                     payload_size=args.payload_size,
+                    invalid_variant=invalid_variant,
                 )
                 device_id = msg["deviceId"]
+                sent_at = msg.get("sent_at") or msg["ts"]
                 expected_topic = (
                     config.KAFKA_TOPIC_TELEMETRY_VALIDATED
                     if valid
@@ -420,7 +567,8 @@ def run_kafka_e2e(args: argparse.Namespace) -> tuple[Path, Path]:
                     "expected_topic": expected_topic,
                     "actual_topic": "",
                     "payload_valid": valid,
-                    "sent_at": msg["sent_at"],
+                    "invalid_variant": invalid_variant,
+                    "sent_at": sent_at,
                     "produced_at": produced_at,
                     "validated_seen_at": "",
                     "dlq_seen_at": "",
