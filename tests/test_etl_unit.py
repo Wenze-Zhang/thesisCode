@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 
-def _climate_payload(values, ts="2024-06-01T12:00:00+00:00"):
+def _climate_payload(values, ts="2026-06-01T12:00:00+00:00"):
     return {
         "deviceName": "climate-lab-01",
         "deviceId": "dev-climate-01",
@@ -102,7 +102,7 @@ def test_missing_values_goes_to_dlq(etl_module, config_module, loaded_registry):
         {
             "deviceName": "climate-lab-01",
             "deviceId": "dev-climate-01",
-            "ts": "2024-06-01T12:00:00+00:00",
+            "ts": "2026-06-01T12:00:00+00:00",
         },
         {},
         reg=loaded_registry,
@@ -118,7 +118,7 @@ def test_epoch_millisecond_timestamp_is_converted_to_iso_timestamp(
     config_module,
     loaded_registry,
 ):
-    epoch_ms = 1_717_244_096_123
+    epoch_ms = 1_780_316_096_123
     expected = datetime.fromtimestamp(epoch_ms / 1000.0, tz=timezone.utc).isoformat()
 
     target, payload = etl_module.process_message(
@@ -135,7 +135,7 @@ def test_epoch_millisecond_timestamp_is_converted_to_iso_timestamp(
 
 
 def test_iso_timestamp_is_accepted(etl_module, config_module, loaded_registry):
-    iso_ts = "2024-06-01T12:34:56Z"
+    iso_ts = "2026-06-01T12:34:56Z"
 
     target, payload = etl_module.process_message(
         _climate_payload({"temperature_c": 21.5}, ts=iso_ts),

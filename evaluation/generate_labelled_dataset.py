@@ -147,7 +147,7 @@ def _case(
 def build_case(reg: registry.Registry, seq: int, category: str, rng: random.Random) -> dict[str, Any]:
     case_id = f"C{seq:03d}"
     sensor_type = _sensor_type(reg, rng)
-    timestamp = "2024-06-01T12:00:00+00:00"
+    timestamp = "2026-06-01T12:00:00+00:00"
 
     if category == "valid_canonical":
         name, field = rng.choice(_field_items(reg, sensor_type))
@@ -177,7 +177,7 @@ def build_case(reg: registry.Registry, seq: int, category: str, rng: random.Rand
 
     if category == "epoch_timestamp":
         name, field = rng.choice(_field_items(reg, sensor_type))
-        msg = _base_message(sensor_type, seq, {name: _valid_value(field, rng)}, 1_717_244_096_123)
+        msg = _base_message(sensor_type, seq, {name: _valid_value(field, rng)}, 1_780_316_096_123)
         return _case(
             case_id,
             category,
@@ -190,7 +190,7 @@ def build_case(reg: registry.Registry, seq: int, category: str, rng: random.Rand
 
     if category == "iso_timestamp":
         name, field = rng.choice(_field_items(reg, sensor_type))
-        msg = _base_message(sensor_type, seq, {name: _valid_value(field, rng)}, "2024-06-01T12:00:00Z")
+        msg = _base_message(sensor_type, seq, {name: _valid_value(field, rng)}, "2026-06-01T12:00:00Z")
         return _case(
             case_id,
             category,

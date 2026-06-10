@@ -66,7 +66,7 @@ KAFKA_EVENT_COLUMNS = [
     "latency_ms",
 ]
 
-
+# parameters into python dict
 def _parse_rates(value: str) -> list[float]:
     rates = []
     for token in value.split(","):
@@ -81,23 +81,26 @@ def _parse_rates(value: str) -> list[float]:
         raise argparse.ArgumentTypeError("At least one rate is required")
     return rates
 
-
+# 1.5 into 1p5 to put into deviceId or kafka consumer group id
 def _rate_label(rate: float) -> str:
     return str(rate).replace(".", "p")
 
-
+# return timestamp in iso format with timezone
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# ISO string to datatime
 def _parse_iso(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+# calcualte p50, p95, p99 percentiles
 def _percentile(values: list[float], percentile: float) -> float | None:
     if not values:
         return None
     ordered = sorted(values)
+    # linear interpolation 
     rank = (len(ordered) - 1) * percentile / 100.0
     lower = math.floor(rank)
     upper = math.ceil(rank)
@@ -106,7 +109,7 @@ def _percentile(values: list[float], percentile: float) -> float | None:
     weight = rank - lower
     return round(ordered[lower] * (1 - weight) + ordered[upper] * weight, 6)
 
-
+# payload size padding to increase processing time and message size
 def _padding(payload_size: str) -> str:
     if payload_size == "small":
         return ""
@@ -117,6 +120,7 @@ def _padding(payload_size: str) -> str:
     raise ValueError(f"Unsupported payload size: {payload_size}")
 
 
+# generate messages for testing with valid or invalid values
 def _synthetic_message(
     *,
     test_id: str,
@@ -150,19 +154,23 @@ def _synthetic_message(
     return message
 
 
+# write csv file with header and rows
 def _write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # with is file mangaer. After use, file is closed automatically 
     with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
-
+# test etl without kafka
 def run_local_etl(args: argparse.Namespace) -> Path:
     reg = registry.load_registry(str(REGISTRY_PATH))
     rng = random.Random(args.seed)
     rows = []
 
+    # different rates
     for rate in args.rates:
         produced_count = max(1, int(rate * args.duration_s))
         validated_count = 0
@@ -171,6 +179,7 @@ def run_local_etl(args: argparse.Namespace) -> Path:
         latencies_ms: list[float] = []
         start = time.perf_counter()
 
+        # generate testing messages
         for seq in range(1, produced_count + 1):
             valid = rng.random() >= args.invalid_ratio
             msg = _synthetic_message(
@@ -180,7 +189,9 @@ def run_local_etl(args: argparse.Namespace) -> Path:
                 valid=valid,
                 payload_size=args.payload_size,
             )
+            
             before = time.perf_counter_ns()
+            
             try:
                 topic, _payload = etl.process_message(msg, {}, reg=reg)
             except Exception:
@@ -251,6 +262,7 @@ def _make_consumer(KafkaConsumer, topic: str, group_id: str, bootstrap_server: s
         group_id=group_id,
         auto_offset_reset="latest",
         enable_auto_commit=False,
+        # bytes in kafka -> python dict
         value_deserializer=lambda value: json.loads(value.decode("utf-8")) if value else {},
     )
     deadline = time.time() + 10
@@ -258,7 +270,7 @@ def _make_consumer(KafkaConsumer, topic: str, group_id: str, bootstrap_server: s
         consumer.poll(timeout_ms=200)
     return consumer
 
-
+# poll messages from validated and dlq topics
 def _collect_outputs(consumer, topic: str, events: dict[str, dict[str, Any]]) -> int:
     seen = 0
     polled = consumer.poll(timeout_ms=250, max_records=500)
@@ -281,6 +293,7 @@ def _collect_outputs(consumer, topic: str, events: dict[str, dict[str, Any]]) ->
                 event["dlq_seen_at"] = seen_at
                 event["actual_topic"] = config.KAFKA_TOPIC_DLQ
             try:
+                # latency calculation 
                 event["latency_ms"] = round(
                     (_parse_iso(seen_at) - _parse_iso(event["sent_at"])).total_seconds() * 1000.0,
                     6,
@@ -347,7 +360,7 @@ def _summarize_kafka_run(
         ),
     }
 
-
+# run through etl with kafka
 def run_kafka_e2e(args: argparse.Namespace) -> tuple[Path, Path]:
     KafkaConsumer, KafkaProducer = _import_kafka_clients()
     producer = KafkaProducer(

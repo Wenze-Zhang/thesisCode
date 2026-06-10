@@ -5,7 +5,7 @@ import json
 import re
 
 
-def _payload(values, *, canonicalized=None, ts="2024-06-01T12:00:00+00:00"):
+def _payload(values, *, canonicalized=None, ts="2026-06-01T12:00:00+00:00"):
     payload = {
         "ts": ts,
         "device_name": "Climate Lab 01",
@@ -35,8 +35,8 @@ def test_append_telemetry_to_csv_creates_expected_dataset_day_path(
     )
 
     assert dataset_slug == "sensor-climate-lab-01"
-    assert day == "2024-06-01"
-    assert csv_path == tmp_path / dataset_slug / "2024-06-01.csv"
+    assert day == "2026-06-01"
+    assert csv_path == tmp_path / dataset_slug / "2026-06-01.csv"
     assert csv_path.exists()
 
 
@@ -74,7 +74,7 @@ def test_later_new_field_expands_header_without_losing_existing_rows(
         tmp_path,
     )
     exporter_module.append_telemetry_to_csv(
-        _payload({"humidity_pct": 46.0}, ts="2024-06-01T12:01:00+00:00"),
+        _payload({"humidity_pct": 46.0}, ts="2026-06-01T12:01:00+00:00"),
         tmp_path,
     )
 
@@ -111,7 +111,7 @@ def test_discover_pending_csvs_finds_sensor_csvs(exporter_module, tmp_path):
     )
     ignored_dir = tmp_path / "not-a-sensor"
     ignored_dir.mkdir()
-    (ignored_dir / "2024-06-01.csv").write_text("ignored\n", encoding="utf-8")
+    (ignored_dir / "2026-06-01.csv").write_text("ignored\n", encoding="utf-8")
 
     pending = exporter_module.discover_pending_csvs(tmp_path)
 
