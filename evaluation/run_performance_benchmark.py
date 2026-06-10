@@ -7,6 +7,7 @@ import json
 import math
 import random
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -70,10 +71,11 @@ ENUM_SENSOR_TYPES = [
     "ev_charger",
 ]
 
+# Device count is fixed across presets so offered load is the only controlled variable.
 WORKLOAD_PRESETS = {
-    "small": {"offered_load_msg_s": 10.0, "device_count": 10},
-    "medium": {"offered_load_msg_s": 50.0, "device_count": 50},
-    "big": {"offered_load_msg_s": 100.0, "device_count": 100},
+    "small": {"offered_load_msg_s": 100.0, "device_count": 100},
+    "medium": {"offered_load_msg_s": 500.0, "device_count": 100},
+    "big": {"offered_load_msg_s": 1000.0, "device_count": 100},
 }
 
 SENSOR_TYPE_CHOICES = [*SENSOR_TYPES, "mixed"]
@@ -391,6 +393,7 @@ def _collect_outputs(
     consumer,
     topic: str,
     events: dict[str, dict[str, Any]],
+    lock: threading.Lock,
     *,
     timeout_ms: int = 0,
     max_records: int = 500,
@@ -399,88 +402,84 @@ def _collect_outputs(
     polled = consumer.poll(timeout_ms=timeout_ms, max_records=max_records)
     seen_at = _now_iso()
     seen_perf = time.perf_counter()
-    for batch in polled.values():
-        for record in batch:
-            payload = record.value or {}
-            device_id = payload.get("device_id") or payload.get("deviceId")
-            ts = payload.get("ts") or payload.get("timestamp") or ""
-            event_key = _event_key(str(device_id), str(ts))
-            if event_key not in events:
-                continue
-            event = events[event_key]
-            if topic == config.KAFKA_TOPIC_TELEMETRY_VALIDATED:
-                if event.get("validated_seen_at"):
+    with lock:
+        for batch in polled.values():
+            for record in batch:
+                payload = record.value or {}
+                device_id = payload.get("device_id") or payload.get("deviceId")
+                ts = payload.get("ts") or payload.get("timestamp") or ""
+                event_key = _event_key(str(device_id), str(ts))
+                if event_key not in events:
                     continue
-                event["validated_seen_at"] = seen_at
-            else:
-                if event.get("dlq_seen_at"):
-                    continue
-                event["dlq_seen_at"] = seen_at
-            if not event.get("output_seen_at"):
-                event["output_seen_at"] = seen_at
-                event["actual_topic"] = topic
-                try:
-                    # latency calculation
-                    sent_perf = event.get("sent_perf")
-                    if sent_perf is not None:
-                        latency_s = seen_perf - float(sent_perf)
-                    else:
-                        latency_s = (
-                            _parse_iso(seen_at) - _parse_iso(event["sent_at"])
-                        ).total_seconds()
-                    event["latency_ms"] = round(latency_s * 1000.0, 6)
-                except Exception:
-                    event["latency_ms"] = None
-            elif event.get("actual_topic") not in ("", topic, "multiple"):
-                event["actual_topic"] = "multiple"
-            seen += 1
+                event = events[event_key]
+                if topic == config.KAFKA_TOPIC_TELEMETRY_VALIDATED:
+                    if event.get("validated_seen_at"):
+                        continue
+                    event["validated_seen_at"] = seen_at
+                else:
+                    if event.get("dlq_seen_at"):
+                        continue
+                    event["dlq_seen_at"] = seen_at
+                if not event.get("output_seen_at"):
+                    event["output_seen_at"] = seen_at
+                    event["seen_perf"] = seen_perf
+                    event["actual_topic"] = topic
+                    try:
+                        # latency calculation
+                        sent_perf = event.get("sent_perf")
+                        if sent_perf is not None:
+                            latency_s = seen_perf - float(sent_perf)
+                        else:
+                            latency_s = (
+                                _parse_iso(seen_at) - _parse_iso(event["sent_at"])
+                            ).total_seconds()
+                        event["latency_ms"] = round(latency_s * 1000.0, 6)
+                    except Exception:
+                        event["latency_ms"] = None
+                elif event.get("actual_topic") not in ("", topic, "multiple"):
+                    event["actual_topic"] = "multiple"
+                seen += 1
     return seen
 
 
-def _collect_kafka_outputs(
+def _collector_loop(
     validated_consumer,
     dlq_consumer,
     events: dict[str, dict[str, Any]],
-    *,
-    timeout_ms: int = 0,
-) -> int:
-    seen = 0
-    seen += _collect_outputs(
-        validated_consumer,
-        config.KAFKA_TOPIC_TELEMETRY_VALIDATED,
-        events,
-        timeout_ms=timeout_ms,
-    )
-    seen += _collect_outputs(
-        dlq_consumer,
-        config.KAFKA_TOPIC_DLQ,
-        events,
-        timeout_ms=timeout_ms,
-    )
-    return seen
-
-
-def _sleep_with_output_collection(
-    *,
-    until_perf: float,
-    poll_interval_s: float,
-    validated_consumer,
-    dlq_consumer,
-    events: dict[str, dict[str, Any]],
+    lock: threading.Lock,
+    stop_event: threading.Event,
+    poll_timeout_ms: int,
 ) -> None:
+    # Each consumer is only ever used from this thread; the events dict is the
+    # shared state and is guarded by the lock.
+    while not stop_event.is_set():
+        _collect_outputs(
+            validated_consumer,
+            config.KAFKA_TOPIC_TELEMETRY_VALIDATED,
+            events,
+            lock,
+            timeout_ms=poll_timeout_ms,
+        )
+        _collect_outputs(
+            dlq_consumer,
+            config.KAFKA_TOPIC_DLQ,
+            events,
+            lock,
+            timeout_ms=poll_timeout_ms,
+        )
+
+
+def _pace_until(target_perf: float) -> None:
+    # Open-loop pacing: sleep for the bulk of the wait, then yield-spin the
+    # last ~2 ms because time.sleep granularity is too coarse at 1000 msg/s.
     while True:
-        remaining_s = until_perf - time.perf_counter()
+        remaining_s = target_perf - time.perf_counter()
         if remaining_s <= 0:
             return
-        _collect_kafka_outputs(
-            validated_consumer,
-            dlq_consumer,
-            events,
-            timeout_ms=0,
-        )
-        sleep_s = min(remaining_s, max(poll_interval_s, 0.001))
-        if sleep_s > 0:
-            time.sleep(sleep_s)
+        if remaining_s > 0.002:
+            time.sleep(remaining_s - 0.001)
+        else:
+            time.sleep(0)
 
 
 def _summarize_kafka_run(
@@ -492,6 +491,7 @@ def _summarize_kafka_run(
     device_count: int,
     events: dict[str, dict[str, Any]],
     produce_elapsed_s: float,
+    backlog_end_of_production: int,
 ) -> dict[str, Any]:
     produced_count = len(events)
     validated_count = sum(1 for event in events.values() if event.get("validated_seen_at"))
@@ -526,29 +526,63 @@ def _summarize_kafka_run(
         for event in events.values()
         if event.get("actual_topic") == event.get("expected_topic")
     )
-    observed_backlog_after_cooldown_count = message_loss_count
-    produced_throughput_msg_s = round(
+    backlog_after_cooldown = message_loss_count
+    input_rate_msg_s = round(
         produced_count / max(produce_elapsed_s, 0.000001),
         6,
     )
     target_achieved_ratio = (
-        round(produced_throughput_msg_s / rate, 6)
+        round(input_rate_msg_s / rate, 6)
         if rate > 0
         else None
     )
-    fast_path_latencies = [
+
+    # ETL throughput over the real processing window: first send to last
+    # observed output (covers messages drained during cooldown).
+    sent_perfs = [
+        float(event["sent_perf"])
+        for event in events.values()
+        if event.get("sent_perf") is not None
+    ]
+    seen_perfs = [
+        float(event["seen_perf"])
+        for event in events.values()
+        if event.get("seen_perf") is not None
+    ]
+    if sent_perfs and seen_perfs:
+        process_window_s = max(seen_perfs) - min(sent_perfs)
+        etl_throughput_msg_s = round(
+            etl_output_count / max(process_window_s, 0.000001),
+            6,
+        )
+        process_window_s = round(process_window_s, 6)
+    else:
+        process_window_s = None
+        etl_throughput_msg_s = None
+
+    # Validation latency strictly follows t_validated - t_raw, so only
+    # messages that landed on the validated topic count; the DLQ path is
+    # reported separately as a sanity check.
+    validation_latencies = [
         float(event["latency_ms"])
         for event in events.values()
-        if event.get("output_seen_at") and event.get("latency_ms") is not None
+        if event.get("actual_topic") == config.KAFKA_TOPIC_TELEMETRY_VALIDATED
+        and event.get("latency_ms") is not None
     ]
-    p95 = _percentile(fast_path_latencies, 95)
+    dlq_latencies = [
+        float(event["latency_ms"])
+        for event in events.values()
+        if event.get("actual_topic") == config.KAFKA_TOPIC_DLQ
+        and event.get("latency_ms") is not None
+    ]
+    p95 = _percentile(validation_latencies, 95)
     unexpected_dlq_rate = (
         round(unexpected_dlq_count / expected_validated_count, 6)
         if expected_validated_count
         else 0.0
     )
     fail_reasons: list[str] = []
-    if observed_backlog_after_cooldown_count != 0:
+    if backlog_after_cooldown != 0:
         fail_reasons.append("observed_backlog_after_cooldown")
     elif message_loss_count != 0:
         fail_reasons.append("message_loss")
@@ -570,6 +604,7 @@ def _summarize_kafka_run(
     passed = not fail_reasons
 
     return {
+        # Run identity
         "test_id": args.test_id,
         "repetition": repetition,
         "workload": workload,
@@ -582,9 +617,21 @@ def _summarize_kafka_run(
         "per_device_rate_msg_s": round(rate / device_count, 6) if device_count else None,
         "duration_s": args.duration_s,
         "produce_elapsed_s": round(produce_elapsed_s, 6),
+        # Core metrics
+        "input_rate_msg_s": input_rate_msg_s,
+        "etl_throughput_msg_s": etl_throughput_msg_s,
+        "validation_latency_p50_ms": _percentile(validation_latencies, 50),
+        "validation_latency_p95_ms": p95,
+        "validation_latency_p99_ms": _percentile(validation_latencies, 99),
+        "validation_latency_max_ms": (
+            round(max(validation_latencies), 6) if validation_latencies else None
+        ),
+        "backlog_end_of_production": backlog_end_of_production,
+        "backlog_after_cooldown": backlog_after_cooldown,
+        # Sanity-check metrics
+        "process_window_s": process_window_s,
         "target_produced_count": round(rate * args.duration_s),
         "produced_count": produced_count,
-        "produced_throughput_msg_s": produced_throughput_msg_s,
         "target_achieved_ratio": target_achieved_ratio,
         "target_achieved_threshold": args.target_achieved_threshold,
         "validated_count": validated_count,
@@ -594,6 +641,8 @@ def _summarize_kafka_run(
             etl_output_count / max(produce_elapsed_s, 0.000001),
             6,
         ),
+        "dlq_latency_p50_ms": _percentile(dlq_latencies, 50),
+        "dlq_latency_p95_ms": _percentile(dlq_latencies, 95),
         "message_loss_count": message_loss_count,
         "expected_validated_count": expected_validated_count,
         "expected_dlq_count": expected_dlq_count,
@@ -611,13 +660,7 @@ def _summarize_kafka_run(
             expected_dlq_count,
         ),
         "routing_success_rate": _safe_rate(correctly_routed_count, produced_count),
-        "observed_backlog_after_cooldown_count": observed_backlog_after_cooldown_count,
         "cooldown_s": args.cooldown_s,
-        "p50_fast_path_latency_ms": _percentile(fast_path_latencies, 50),
-        "p95_fast_path_latency_ms": p95,
-        "max_fast_path_latency_ms": (
-            round(max(fast_path_latencies), 6) if fast_path_latencies else None
-        ),
         "latency_threshold_ms": args.latency_threshold_ms,
         "fail_reason": _join_fail_reasons(fail_reasons),
         "benchmark_result_pass_fail": "pass" if passed else "fail",
@@ -657,6 +700,23 @@ def run_kafka_e2e(args: argparse.Namespace) -> tuple[Path, Path]:
                     args.bootstrap_server,
                 )
                 events: dict[str, dict[str, Any]] = {}
+                events_lock = threading.Lock()
+                stop_event = threading.Event()
+                # Output collection runs in a background thread so the send
+                # loop can sustain high offered loads (1000 msg/s and above).
+                collector = threading.Thread(
+                    target=_collector_loop,
+                    args=(
+                        validated_consumer,
+                        dlq_consumer,
+                        events,
+                        events_lock,
+                        stop_event,
+                        max(int(args.live_poll_interval_s * 1000), 10),
+                    ),
+                    daemon=True,
+                )
+                collector.start()
                 send_futures: list[tuple[dict[str, Any], Any]] = []
                 seq = 0
                 invalid_seq = 0
@@ -716,7 +776,8 @@ def run_kafka_e2e(args: argparse.Namespace) -> tuple[Path, Path]:
                         "output_seen_at": "",
                         "latency_ms": "",
                     }
-                    events[event_key] = event
+                    with events_lock:
+                        events[event_key] = event
                     future = producer.send(config.KAFKA_TOPIC_TELEMETRY_RAW, msg)
                     future.add_callback(
                         lambda _metadata, event=event: event.__setitem__(
@@ -726,21 +787,9 @@ def run_kafka_e2e(args: argparse.Namespace) -> tuple[Path, Path]:
                     )
                     send_futures.append((event, future))
 
-                    _collect_kafka_outputs(
-                        validated_consumer,
-                        dlq_consumer,
-                        events,
-                        timeout_ms=0,
-                    )
-
                     next_send += 1.0 / rate
-                    _sleep_with_output_collection(
-                        until_perf=next_send,
-                        poll_interval_s=args.live_poll_interval_s,
-                        validated_consumer=validated_consumer,
-                        dlq_consumer=dlq_consumer,
-                        events=events,
-                    )
+                    if next_send > time.perf_counter():
+                        _pace_until(next_send)
 
                 producer.flush(timeout=10)
                 for event, future in send_futures:
@@ -748,18 +797,21 @@ def run_kafka_e2e(args: argparse.Namespace) -> tuple[Path, Path]:
                     if not event.get("produced_at"):
                         event["produced_at"] = _now_iso()
                 produce_elapsed_s = max(time.perf_counter() - start, 0.000001)
+                with events_lock:
+                    backlog_end_of_production = sum(
+                        1 for event in events.values() if not event.get("actual_topic")
+                    )
                 output_deadline = time.time() + args.cooldown_s
                 while time.time() < output_deadline:
-                    seen = _collect_kafka_outputs(
-                        validated_consumer,
-                        dlq_consumer,
-                        events,
-                        timeout_ms=250,
-                    )
-                    if sum(1 for event in events.values() if event.get("actual_topic")) == len(events):
+                    with events_lock:
+                        pending = sum(
+                            1 for event in events.values() if not event.get("actual_topic")
+                        )
+                    if pending == 0:
                         break
-                    if seen == 0:
-                        time.sleep(0.25)
+                    time.sleep(0.25)
+                stop_event.set()
+                collector.join(timeout=10)
 
                 summaries.append(
                     _summarize_kafka_run(
@@ -770,6 +822,7 @@ def run_kafka_e2e(args: argparse.Namespace) -> tuple[Path, Path]:
                         device_count=device_count,
                         events=events,
                         produce_elapsed_s=produce_elapsed_s,
+                        backlog_end_of_production=backlog_end_of_production,
                     )
                 )
                 all_events.extend(events.values())
@@ -781,7 +834,11 @@ def run_kafka_e2e(args: argparse.Namespace) -> tuple[Path, Path]:
     # Benchmark event and summary files are written here for reproducible analysis.
     events_path = args.results_dir / "kafka_e2e_benchmark_events.csv"
     summary_path = args.results_dir / "kafka_e2e_benchmark_summary.json"
+    summary_csv_path = args.results_dir / "benchmark_kafka_summary.csv"
     _write_csv(events_path, KAFKA_EVENT_COLUMNS, all_events)
+    if summaries:
+        _write_csv(summary_csv_path, list(summaries[0].keys()), summaries)
+        print(f"Wrote {summary_csv_path}")
     summary_doc = {
         "generated_at": _now_iso(),
         "bootstrap_server": args.bootstrap_server,
@@ -826,11 +883,11 @@ def main() -> int:
         default=None,
         help="Device count for custom --rate workloads.",
     )
-    parser.add_argument("--duration-s", type=int, default=300)
+    parser.add_argument("--duration-s", type=int, default=60)
     parser.add_argument("--payload-size", choices=["small", "medium", "large"], default="small")
     parser.add_argument("--sensor-type", choices=SENSOR_TYPE_CHOICES, default="climate")
     parser.add_argument("--invalid-ratio", type=float, default=0.2)
-    parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--test-id", default="perf-run-001")
     parser.add_argument("--bootstrap-server", default=config.KAFKA_BOOTSTRAP_SERVERS)
     parser.add_argument("--cooldown-s", type=int, default=30)

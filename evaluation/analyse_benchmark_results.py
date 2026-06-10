@@ -101,7 +101,7 @@ def _target_achieved_ratio(row: dict[str, Any]) -> float | None:
     if offered_load is None or offered_load <= 0:
         return None
 
-    produced_throughput = _float(row, "produced_throughput_msg_s")
+    produced_throughput = _metric(row, ["input_rate_msg_s", "produced_throughput_msg_s"])
     if produced_throughput is not None:
         return produced_throughput / offered_load
 
@@ -141,13 +141,16 @@ def _derived_fail_reasons(row: dict[str, Any]) -> list[str]:
     reasons: list[str] = _split_reasons(row.get("fail_reason"))
     if _int(row, "message_loss_count") != 0:
         reasons.append("message_loss")
-    if _int(row, "observed_backlog_after_cooldown_count") != 0:
+    backlog = _metric(
+        row, ["backlog_after_cooldown", "observed_backlog_after_cooldown_count"]
+    )
+    if backlog:
         reasons.append("observed_backlog_after_cooldown")
     if _int(row, "misrouted_count") != 0:
         reasons.append("misrouted_message")
 
     threshold = _float(row, "latency_threshold_ms")
-    p95 = _metric(row, ["p95_fast_path_latency_ms"])
+    p95 = _metric(row, ["validation_latency_p95_ms", "p95_fast_path_latency_ms"])
     if threshold is not None and (p95 is None or p95 > threshold):
         reasons.append("p95_latency_above_threshold")
     if not _target_load_ok(row):
@@ -374,18 +377,18 @@ def _plot_outputs(
     _plot_line_series(
         results_dir=results_dir,
         rows=rows,
-        metric_keys=["etl_output_throughput_msg_s"],
+        metric_keys=["etl_throughput_msg_s", "etl_output_throughput_msg_s"],
         filename="throughput_vs_offered_load.png",
-        ylabel="ETL output throughput (msg/s)",
+        ylabel="ETL throughput (msg/s)",
         title="Throughput vs offered load",
     )
     _plot_line_series(
         results_dir=results_dir,
         rows=rows,
-        metric_keys=["p95_fast_path_latency_ms"],
-        filename="p95_fast_path_latency_vs_offered_load.png",
-        ylabel="p95 latency (ms)",
-        title="p95 fast-path latency vs offered load",
+        metric_keys=["validation_latency_p95_ms", "p95_fast_path_latency_ms"],
+        filename="p95_validation_latency_vs_offered_load.png",
+        ylabel="p95 validation latency (ms)",
+        title="p95 validation latency vs offered load",
     )
     _plot_validated_vs_dlq(results_dir, rows)
     _plot_sustainable(results_dir, sustainable_rows)
