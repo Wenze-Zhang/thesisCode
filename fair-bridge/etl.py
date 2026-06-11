@@ -19,7 +19,7 @@ logging.basicConfig(
 log = logging.getLogger("fair-bridge-etl")
 
 
-# consider which fields are metadata
+#  metadata
 _META_KEYS = {
     "deviceName",
     "deviceType",
@@ -44,6 +44,7 @@ def _wait_kafka(bootstrap: str, timeout: int) -> None:
     
     
     while time.time() < deadline:
+        # test kafka connection by creating and closing a producer
         try:
             KafkaProducer(bootstrap_servers=bootstrap).close()
             return

@@ -8,7 +8,7 @@ LICENSE_ID = "CC-BY-4.0" #example, or other license ID
 def _canonical(registry: Registry, key: str) -> str:
     return registry.alias_to_canonical.get(str(key).lower(), key)
 
-
+# semantic field
 def _has_semantics(field: dict | None) -> bool:
     if not field:
         return False
@@ -22,7 +22,7 @@ def _has_semantics(field: dict | None) -> bool:
         )
     )
 
-
+# infer metdata from registry
 def infer_metadata(
     registry: Registry,
     device_name: str,

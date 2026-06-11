@@ -72,7 +72,7 @@ def wait_for_kafka(bootstrap: str, timeout: int) -> KafkaConsumer:
             time.sleep(4)
     raise RuntimeError(f"Kafka not ready after {timeout}s ({last_exc})")
 
-
+# create CKAN organization if not exists
 def ensure_organization(ckan: RemoteCKAN, org_name: str, title: str) -> None:
     try:
         ckan.action.organization_show(id=org_name)
@@ -235,6 +235,7 @@ def handle_create_or_update(
     event_type: str,
 ) -> None:
     name = event.get("entityName") or headers.get("deviceName") or event.get("name")
+    # name starting from sensor
     slug = slugify(f"sensor-{name}") if name else None
     existing = _existing_dataset(ckan, slug) if slug else None
     pkg = build_dataset(event, headers, reg=reg, existing=existing, event_type=event_type)
