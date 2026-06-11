@@ -1,19 +1,5 @@
 #!/usr/bin/env python3
-"""FAIR Bridge Kafka E2E performance benchmark.
 
-Sends synthetic telemetry (5 sensor types rotated across 100 devices, a
-configurable share of invalid payloads) to the raw topic at a fixed offered
-load, observes the validated/DLQ topics, and reports the core metrics:
-
-- input_rate_msg_s          N_raw / produce window
-- etl_throughput_msg_s      (N_validated + N_dlq) / processing window
-- validation_latency_*      t_validated - t_raw (validated messages only)
-- backlog_*                 N_raw - N_processed
-
-Workloads are given via --workloads: preset names (small/medium/big) for the
-three-tier comparison, or numeric rates (e.g. 1000,1500,2000) for the
-capacity ramp.
-"""
 from __future__ import annotations
 
 import argparse
@@ -40,7 +26,7 @@ DEVICE_COUNT = 100
 if str(FAIR_BRIDGE_DIR) not in sys.path:
     sys.path.insert(0, str(FAIR_BRIDGE_DIR))
 
-import config  # noqa: E402
+import config  
 
 INVALID_VARIANTS = [
     "out_of_range",
