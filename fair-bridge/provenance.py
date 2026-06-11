@@ -1,8 +1,6 @@
 """
-
-PROV-O      https://www.w3.org/TR/prov-o/
-PROV-JSON   https://www.w3.org/Submission/2013/SUBM-prov-json-20130424/
-
+PROV O      https://www.w3.org/TR/prov-o/
+PROV JSON   https://www.w3.org/Submission/2013/SUBM-prov-json-20130424/
 """
 from __future__ import annotations
 
@@ -17,7 +15,7 @@ _AGENT_LABEL = "FAIR Bridge Enricher v2"
 
 
 def now_iso() -> str:
-    """UTC ISO 8601, second precision (matches CKAN's created/modified style)."""
+    # UTC ISO 8601
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
@@ -42,10 +40,7 @@ def build_prov(
     ckan_url: str,
     event_type: str,
 ) -> dict[str, Any]:
-    """Construct a fresh PROV-JSON document for the *first* enrichment of a
-    dataset.  Subsequent enrichments should call :func:`append_activity` on the
-    existing document instead of rebuilding from scratch.
-    """
+    # Construct a fresh PROV JSON document
     ts = now_iso()
     activity_id = f"enricher:{dataset_uuid}#{ts}"
     entity_id = f"ckan:dataset/{dataset_uuid}"
@@ -95,9 +90,7 @@ def build_prov(
 
 def append_activity(prov: dict[str, Any], *, dataset_uuid: str,
                     event_type: str) -> dict[str, Any]:
-    """Append a new Activity to an existing PROV-JSON doc, bounded to
-    :data:`MAX_ACTIVITIES`.
-    """
+    # Append a new Activity to an existing PROV JSON doc, bounded to :data:`MAX_ACTIVITIES`.
     ts = now_iso()
     activity_id = f"enricher:{dataset_uuid}#{ts}"
     activities = prov.setdefault("activity", {})
@@ -111,7 +104,7 @@ def append_activity(prov: dict[str, Any], *, dataset_uuid: str,
         {"prov:activity": activity_id, "prov:agent": _AGENT_ID}
     )
 
-    # Trim if we exceed MAX_ACTIVITIES: keep the newest N, fold the rest into
+    # Trim if exceed MAX_ACTIVITIES: keep the newest N, fold the rest into
     # a single 'summary' activity that records how many were collapsed.
     if len(activities) > MAX_ACTIVITIES:
         items_sorted = sorted(activities.items(),
@@ -128,15 +121,14 @@ def append_activity(prov: dict[str, Any], *, dataset_uuid: str,
 
 
 def to_json_str(prov: dict[str, Any]) -> str:
-    """Serialise to a compact, sorted JSON string for storage in CKAN extras."""
+    # Serialise to a compact, sorted JSON string for storage in CKAN extras.
     return json.dumps(prov, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False)
 
 
 def from_json_str(s: str | None) -> dict[str, Any] | None:
-    """Reverse of :func:`to_json_str`.  Returns ``None`` on empty/invalid input
-    so the caller can fall back to :func:`build_prov`.
-    """
+    # Reverse of ： to_json_str.  Returns None on empty/invalid input
+    # so the caller can fall back to :func:`build_prov`.
     if not s:
         return None
     try:

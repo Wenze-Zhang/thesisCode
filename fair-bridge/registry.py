@@ -27,16 +27,19 @@ class Registry:
         if not isinstance(sensor_types, dict) or not sensor_types:
             raise RegistryError("registry has no sensor_types")
 
-
+        # derivation from yaml -> validation structures
         self.sensor_types = sensor_types  
         self.alias_to_canonical: dict[str, str] = {}
         self.canonical_keys: set[str] = set()
         self._name_aliases: list[tuple[str, list[str]]] = []
 
+        
         for sensor_type, device_type in sensor_types.items():
+            # sensor type must be dict
             if not isinstance(device_type, dict):
                 raise RegistryError(f"sensor_type {sensor_type!r} is not a mapping")
             
+            # fields must be a non empty dict
             fields = device_type.get("fields")
             if not isinstance(fields, dict) or not fields:
                 raise RegistryError(f"sensor_type {sensor_type!r} has no fields")
@@ -52,20 +55,24 @@ class Registry:
             # collect aliases of sensor type names for classification
             self._name_aliases.append((
                 sensor_type,
+                # lowercase aliases
                 [str(alias).lower() for alias in device_type.get("name_aliases") or []],
             ))
             
             
             # validate fields and build alias mapping for field names
             for field_name, field in fields.items():
+                # must be a dict
                 if not isinstance(field, dict):
                     raise RegistryError(
                         f"field {sensor_type}.{field_name} is not a mapping"
                     )
+                # datatype must be supported
                 if field.get("datatype") not in _JSON_TYPE:
                     raise RegistryError(
                         f"field {sensor_type}.{field_name} has unsupported datatype"
                     )
+                
                 self._register_alias(field_name, field_name)
                 for alias in field.get("aliases") or []:
                     self._register_alias(str(alias), field_name)
@@ -128,9 +135,13 @@ class Registry:
             }
         return schemas
 
+
     def canonicalize(self, values: dict) -> tuple[dict, dict, list]:
+        # store canonicalized keys and values. temp-> temperature
         canonicalized: dict[str, Any] = {}
+        # record renamed mapping for telemetry keys.
         renamed: dict[str, str] = {}
+        # record unknown keys 
         unknown: list[str] = []
         
         for key, value in (values or {}).items():
@@ -146,6 +157,7 @@ class Registry:
             canonicalized[canonical] = value
         return canonicalized, renamed, unknown
 
+    # classification of device type by name
     def classify(self, device_name: str) -> str:
         name = (device_name or "").lower()
         for sensor_type, aliases in self._name_aliases:

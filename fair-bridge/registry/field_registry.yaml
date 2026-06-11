@@ -1,6 +1,6 @@
 sensor_types:
   ev_charger:
-    name_aliases: [ev-charger, ev_charger]
+    name_aliases: [ev-charger, ev_charger, evcharger]
     sosa_sensor_uri: https://w3id.org/seas/EVChargingStation
     primary_field: soc_pct
     fields:

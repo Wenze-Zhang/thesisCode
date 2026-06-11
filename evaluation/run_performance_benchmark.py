@@ -60,7 +60,7 @@ WORKLOAD_PRESETS = {
 
 
 def _parse_workloads(value: str) -> list[dict[str, Any]]:
-    """Each token is a preset name or a numeric offered load in msg/s."""
+    # Each token is a preset name or a numeric offered load in msg/s
     specs: list[dict[str, Any]] = []
     for token in value.split(","):
         token = token.strip().lower()
@@ -384,8 +384,8 @@ def _collector_loop(
 
 
 def _pace_until(target_perf: float) -> None:
-    # Open-loop pacing: sleep for the bulk of the wait, then yield-spin the
-    # last ~2 ms because time.sleep granularity is too coarse at 1000 msg/s.
+    # Open loop pacing: sleep for the bulk of the wait, then yield spin the
+    # last 2 ms because time.sleep granularity is too coarse at 1000 msg/s.
     while True:
         remaining_s = target_perf - time.perf_counter()
         if remaining_s <= 0:
@@ -639,6 +639,7 @@ def run_kafka_e2e(args: argparse.Namespace) -> Path:
                 producer.flush(timeout=10)
                 for future in send_futures:
                     future.get(timeout=10)
+                # real time from sending the first message to the last observed output
                 produce_elapsed_s = max(time.perf_counter() - start, 0.000001)
                 with events_lock:
                     backlog_end_of_production = sum(
