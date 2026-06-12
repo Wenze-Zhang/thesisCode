@@ -163,7 +163,7 @@ def _append_or_rewrite_csv(
         writer.writerow(_normalise_row(row, fieldnames))
     os.replace(tmp_path, csv_path)
 
-
+# dynamic CSV header management
 def append_telemetry_to_csv(payload: dict[str, Any], export_dir: Path) -> tuple[str, str, Path]:
     device_name = str(
         payload.get("device_name")

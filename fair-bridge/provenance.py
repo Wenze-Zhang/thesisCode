@@ -11,7 +11,7 @@ from typing import Any
 MAX_ACTIVITIES = 10
 
 _AGENT_ID = "enricher:fair-bridge"
-_AGENT_LABEL = "FAIR Bridge Enricher v2"
+_AGENT_LABEL = "FAIR Bridge Enricher"
 
 
 def now_iso() -> str:

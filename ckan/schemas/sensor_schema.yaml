@@ -34,7 +34,7 @@ dataset_fields:
     label: Organization
     preset: dataset_organization
 
-  # --- Sensor-specific fields ---
+  # Sensor specific fields
 
   - field_name: sensor_type
     label: Sensor Type
@@ -132,7 +132,7 @@ dataset_fields:
     validators: ignore_missing int_validator
     form_placeholder: eg. 5
 
-  # --- FAIR enrichment fields (auto-populated by FAIR Bridge) ---
+  # FAIR enrichment fields 
 
   - field_name: dataset_uuid
     label: Dataset UUID

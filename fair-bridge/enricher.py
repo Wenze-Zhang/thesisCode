@@ -120,6 +120,7 @@ def _device_id(event: dict, headers: dict) -> str:
     return headers.get("deviceId", "")
 
 # from ThingsBoard message to CKAN dataset package dict
+# package, not use CKAN API directly
 def build_dataset(
     event: dict,
     headers: dict,
@@ -302,6 +303,7 @@ def main() -> int:
         config.KAFKA_READY_TIMEOUT_S,
     )
 
+    # listen to lifecycle topic 
     log.info("Listening on topic '%s' ...", config.KAFKA_TOPIC_LIFECYCLE)
     for msg in consumer:
         try:
