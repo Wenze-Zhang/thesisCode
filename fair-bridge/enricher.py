@@ -93,31 +93,30 @@ def _existing_dataset(ckan: RemoteCKAN, slug: str) -> dict | None:
 
 
 
-def _spatial_geojson(lat: float | None, lon: float | None) -> str | None:
-    if lat is None or lon is None:
-        return None
-    return json.dumps({"type": "Point", "coordinates": [float(lon), float(lat)]})
-
-
-
-def _extract_location(event: dict) -> tuple[float | None, float | None]:
+def _extract_sampling_interval(event: dict) -> int | None:
     info = event.get("additionalInfo") or {}
-    lat = info.get("latitude") or info.get("lat")
-    lon = info.get("longitude") or info.get("lon") or info.get("lng")
+    interval = (
+        info.get("samplingInterval")
+        or info.get("sampling_interval")
+        or info.get("sampling_interval_s")
+    )
     try:
-        return (
-            float(lat) if lat is not None else None,
-            float(lon) if lon is not None else None,
-        )
+        return int(float(interval)) if interval is not None else None
     except (TypeError, ValueError):
-        return (None, None)
+        return None
 
 
 def _device_id(event: dict, headers: dict) -> str:
-    for value in (event.get("id"), event.get("entityId")):
-        if isinstance(value, dict) and value.get("id"):
-            return value["id"]
-    return headers.get("deviceId", "")
+    for value in (event.get("entityId"), event.get("id")):
+        if (
+            isinstance(value, dict)
+            and value.get("entityType") == "DEVICE"
+            and value.get("id")
+        ):
+            return str(value["id"])
+    if headers.get("entityType", "DEVICE") == "DEVICE":
+        return headers.get("deviceId", "")
+    return ""
 
 # from ThingsBoard message to CKAN dataset package dict
 # package, not use CKAN API directly
@@ -175,13 +174,9 @@ def build_dataset(
     }
     pkg.update(metadata)
 
-    lat, lon = _extract_location(event)
-    if lat is not None and lon is not None:
-        pkg["latitude"] = lat
-        pkg["longitude"] = lon
-        spatial = _spatial_geojson(lat, lon)
-        if spatial:
-            pkg["spatial"] = spatial
+    sampling_interval = _extract_sampling_interval(event)
+    if sampling_interval is not None:
+        pkg["sampling_interval_s"] = sampling_interval
 
     if prior_provenance is None:
         prov_doc = provenance.build_prov(

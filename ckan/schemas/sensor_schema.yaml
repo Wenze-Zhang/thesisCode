@@ -112,16 +112,6 @@ dataset_fields:
     label: Measurement Unit
     form_placeholder: eg. W, kWh, V, A
 
-  - field_name: latitude
-    label: Latitude
-    validators: ignore_missing unicode_safe
-    form_placeholder: eg. 50.7753
-
-  - field_name: longitude
-    label: Longitude
-    validators: ignore_missing unicode_safe
-    form_placeholder: eg. 6.0839
-
   - field_name: thingsboard_device_id
     label: ThingsBoard Device ID
     help_text: UUID of the corresponding device in ThingsBoard.
@@ -152,11 +142,6 @@ dataset_fields:
   - field_name: qudt_unit_uri
     label: QUDT Unit URI
     help_text: Standardised unit-of-measure URI (FAIR I2).
-    validators: ignore_missing unicode_safe
-
-  - field_name: spatial
-    label: Spatial (GeoJSON)
-    help_text: GeoJSON geometry.
     validators: ignore_missing unicode_safe
 
   - field_name: created_at_iso

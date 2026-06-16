@@ -166,7 +166,11 @@ def main():
     device_name = sys.argv[2] if len(sys.argv) > 2 else config["default_name"]
     interval = float(sys.argv[3]) if len(sys.argv) > 3 else config["default_interval"]
 
-    _, token = ensure_device(device_name, label=config["label"])
+    device_id, token = ensure_device(
+        device_name,
+        label=config["label"],
+        sampling_interval_s=interval,
+    )
     client = mqtt_client(token)
     state = {}
 
@@ -176,6 +180,7 @@ def main():
         while True:
 
             payload = config["generator"](state, interval)
+            payload["deviceId"] = device_id
 
             # Transmit from Python dict to JSON string 
             # ThingsBoard receives operational telemetry in JSON format.

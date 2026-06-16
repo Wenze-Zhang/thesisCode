@@ -21,9 +21,14 @@ def login() -> str:
     return r.json()["token"]
 
 
-def ensure_device(name: str, label: str = "") -> Tuple[str, str]:
+def ensure_device(
+    name: str,
+    label: str = "",
+    sampling_interval_s: float | None = None,
+) -> Tuple[str, str]:
     jwt = login()
     headers = {"X-Authorization": f"Bearer {jwt}"}
+    json_headers = {**headers, "Content-Type": "application/json"}
 
     r = requests.get(
         f"{TB_HOST}/api/tenant/devices",
@@ -33,13 +38,30 @@ def ensure_device(name: str, label: str = "") -> Tuple[str, str]:
     )
     # http return status code
     if r.status_code == 200:
-        device_id = r.json()["id"]["id"]
+        device = r.json()
+        device_id = device["id"]["id"]
         created = False
+        if sampling_interval_s is not None:
+            info = device.get("additionalInfo") or {}
+            if info.get("samplingInterval") != int(sampling_interval_s):
+                info["samplingInterval"] = int(sampling_interval_s)
+                device["additionalInfo"] = info
+                r = requests.post(
+                    f"{TB_HOST}/api/device",
+                    json=device,
+                    headers=json_headers,
+                    timeout=10,
+                )
+                r.raise_for_status()
+                print(f"[tb_client] device '{name}' samplingInterval set to {int(sampling_interval_s)}s")
     elif r.status_code == 404:
+        body = {"name": name, "label": label or name, "type": "default"}
+        if sampling_interval_s is not None:
+            body["additionalInfo"] = {"samplingInterval": int(sampling_interval_s)}
         r = requests.post(
             f"{TB_HOST}/api/device",
-            json={"name": name, "label": label or name, "type": "default"},
-            headers={**headers, "Content-Type": "application/json"},
+            json=body,
+            headers=json_headers,
             timeout=10,
         )
         r.raise_for_status()
