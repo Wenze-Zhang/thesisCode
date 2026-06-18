@@ -132,27 +132,45 @@ def _fieldnames_for(
     return BASE_COLUMNS + existing_dynamic + incoming_dynamic + [CANONICALIZED_COLUMN]
 
 
+def _read_header(csv_path: Path) -> list[str]:
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        return []
+    with csv_path.open("r", newline="", encoding="utf-8") as fh:
+        try:
+            return next(csv.reader(fh))
+        except StopIteration:
+            return []
+
+
 def _append_or_rewrite_csv(
     csv_path: Path,
     row: dict[str, Any],
     incoming_value_keys: list[str],
+    header_cache: dict[Path, list[str]],
 ) -> None:
-    existing_rows: list[dict[str, Any]] = []
-    existing_fieldnames: list[str] = []
-
-    if csv_path.exists() and csv_path.stat().st_size > 0:
-        with csv_path.open("r", newline="", encoding="utf-8") as fh:
-            reader = csv.DictReader(fh)
-            existing_fieldnames = reader.fieldnames or []
-            existing_rows = list(reader)
+    # Cache each file's header so the steady-state path never re-reads the file;
+    # the exporter is the sole writer, so the cache stays consistent with disk.
+    existing_fieldnames = header_cache.get(csv_path)
+    if existing_fieldnames is None:
+        existing_fieldnames = _read_header(csv_path)
 
     fieldnames = _fieldnames_for(existing_fieldnames, incoming_value_keys)
+    file_has_data = csv_path.exists() and csv_path.stat().st_size > 0
 
-    if csv_path.exists() and csv_path.stat().st_size > 0 and fieldnames == existing_fieldnames:
+    # Fast path: header unchanged -> append one row, no full-file read.
+    if file_has_data and fieldnames == existing_fieldnames:
         with csv_path.open("a", newline="", encoding="utf-8") as fh:
             writer = csv.DictWriter(fh, fieldnames=fieldnames)
             writer.writerow(_normalise_row(row, fieldnames))
+        header_cache[csv_path] = fieldnames
         return
+
+    # New file or grown header: rewrite. Reading every existing row happens
+    # only here, not on every message.
+    existing_rows: list[dict[str, Any]] = []
+    if file_has_data:
+        with csv_path.open("r", newline="", encoding="utf-8") as fh:
+            existing_rows = list(csv.DictReader(fh))
 
     tmp_path = csv_path.with_suffix(csv_path.suffix + ".tmp")
     with tmp_path.open("w", newline="", encoding="utf-8") as fh:
@@ -162,9 +180,14 @@ def _append_or_rewrite_csv(
             writer.writerow(_normalise_row(existing_row, fieldnames))
         writer.writerow(_normalise_row(row, fieldnames))
     os.replace(tmp_path, csv_path)
+    header_cache[csv_path] = fieldnames
 
 # dynamic CSV header management
-def append_telemetry_to_csv(payload: dict[str, Any], export_dir: Path) -> tuple[str, str, Path]:
+def append_telemetry_to_csv(
+    payload: dict[str, Any],
+    export_dir: Path,
+    header_cache: dict[Path, list[str]],
+) -> tuple[str, str, Path]:
     device_name = str(
         payload.get("device_name")
         or payload.get("deviceName")
@@ -195,8 +218,8 @@ def append_telemetry_to_csv(payload: dict[str, Any], export_dir: Path) -> tuple[
         row[str(key)] = _cell_value(value)
     row[CANONICALIZED_COLUMN] = _canonicalized_value(payload.get(CANONICALIZED_COLUMN))
 
-    _append_or_rewrite_csv(csv_path, row, incoming_value_keys)
-    log.info("CSV append <- device=%s date=%s path=%s", device_name, day, csv_path)
+    _append_or_rewrite_csv(csv_path, row, incoming_value_keys, header_cache)
+    log.debug("CSV append <- device=%s date=%s path=%s", device_name, day, csv_path)
     return dataset_slug, day, csv_path
 
 
@@ -296,11 +319,6 @@ def flush_dirty_csvs(
     return remaining
 
 
-def commit_message(consumer: KafkaConsumer, msg: Any) -> None:
-    partition = TopicPartition(msg.topic, msg.partition)
-    consumer.commit({partition: OffsetAndMetadata(msg.offset + 1, None)})
-
-
 def main() -> int:
     log.info("Telemetry exporter starting...")
     log.info("Listening on topic %s", config.KAFKA_TOPIC_TELEMETRY_VALIDATED)
@@ -331,6 +349,7 @@ def main() -> int:
 
     last_flush = 0.0
     flush_interval = max(1, config.EXPORT_FLUSH_INTERVAL_S)
+    header_cache: dict[Path, list[str]] = {}
 
     while True:
         try:
@@ -340,19 +359,34 @@ def main() -> int:
             time.sleep(2)
             continue
 
-        for batch in records.values():
+        # Commit once per poll instead of once per message. Per partition we
+        # advance the commit offset only up to the last contiguous success, so
+        # a CSV write failure leaves that message uncommitted and reread on restart (at least once).
+        offsets_to_commit: dict[TopicPartition, OffsetAndMetadata] = {}
+        for tp, batch in records.items():
             for msg in batch:
                 try:
-                    dataset_slug, day, csv_path = append_telemetry_to_csv(msg.value or {}, export_dir)
+                    dataset_slug, day, csv_path = append_telemetry_to_csv(
+                        msg.value or {}, export_dir, header_cache
+                    )
                     dirty.add((dataset_slug, day, csv_path))
                 except Exception:
-                    log.exception("Failed to write CSV for Kafka offset %s; offset not committed", msg.offset)
-                    continue
+                    log.exception(
+                        "Failed to write CSV for Kafka offset %s on %s; "
+                        "not committing past it",
+                        msg.offset,
+                        tp,
+                    )
+                    break
+                offsets_to_commit[tp] = OffsetAndMetadata(msg.offset + 1, None)
 
-                try:
-                    commit_message(consumer, msg)
-                except Exception:
-                    log.exception("Kafka commit failed after CSV append at offset %s", msg.offset)
+        if offsets_to_commit:
+            try:
+                consumer.commit(offsets_to_commit)
+            except Exception:
+                log.exception(
+                    "Kafka batch commit failed for %d partition(s)", len(offsets_to_commit)
+                )
 
         if time.time() - last_flush >= flush_interval:
             if dirty:
