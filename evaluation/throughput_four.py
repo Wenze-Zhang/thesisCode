@@ -42,7 +42,7 @@ exporter = bench.exporter
 
 DEFAULT_RESULTS_DIR = bench.REPO_ROOT / "evaluation" / "results" / "thesis_throughput4"
 # Slowly increasing offered load; each step is an isolated experiment.
-DEFAULT_STEPS = "50,100,150,200,300,400,500,600"
+DEFAULT_STEPS = "50,100,150,200,300,400,500,600,700,800"
 
 # The four reported throughput curves: each is the makespan completion rate at a
 # pipeline stage (stage arrivals / (last stage arrival - first send)). They map
@@ -366,22 +366,32 @@ def run_steps(args: argparse.Namespace, KafkaConsumer) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     total_produced = 0
     total_failed = 0
-    print(f"[steps] {len(args.steps)} isolated steps x {args.dwell_s:g}s dwell, "
-          f"{args.device_count} fresh devices each (makespan metric, no guard).")
+    reps = args.repetitions
+    print(f"[steps] {len(args.steps)} offered loads x {reps} reps x {args.dwell_s:g}s "
+          f"dwell, {args.device_count} fresh devices each (makespan metric, no guard). "
+          f"Every rep provisions new datasets and drains to zero, so no rep can be "
+          f"affected by the backlog of a previous one.")
+    stop = False
     for index, rate in enumerate(args.steps):
-        print(f"\n=== step {index + 1}/{len(args.steps)}: offered={rate:g} msg/s "
-              f"(brand-new datasets) ===")
-        row = run_single_step(args, rate, index, KafkaConsumer)
-        row["step"] = index + 1
-        total_produced += row["produced_in_step"]
-        rows.append(row)
-        # A step that could not drain leaves backlog in the SHARED exporter group;
-        # the next fresh-dataset step would queue behind it (contamination). That
-        # first non-draining step is where the system's capacity is exceeded, so stop.
-        if not row["drained"] and args.stop_after_crash:
-            print(f"[steps] step {index + 1} did not drain within "
-                  f"{args.drain_timeout_s:g}s -> capacity exceeded; stopping the "
-                  f"ramp here (later steps would be contaminated by its backlog).")
+        for rep in range(1, reps + 1):
+            print(f"\n=== step {index + 1}/{len(args.steps)} rep {rep}/{reps}: "
+                  f"offered={rate:g} msg/s (brand-new datasets) ===")
+            # Unique rng/test-id per rep so devices, datasets and seeds never collide.
+            row = run_single_step(args, rate, index * reps + (rep - 1), KafkaConsumer)
+            row["step"] = index + 1
+            row["rep"] = rep
+            total_produced += row["produced_in_step"]
+            rows.append(row)
+            # A rep that could not drain leaves backlog in the SHARED exporter group;
+            # the next fresh-dataset rep/step would queue behind it (contamination).
+            # That first non-draining rep is where capacity is exceeded, so stop.
+            if not row["drained"] and args.stop_after_crash:
+                print(f"[steps] offered={rate:g} rep {rep} did not drain within "
+                      f"{args.drain_timeout_s:g}s -> capacity exceeded; stopping the "
+                      f"ramp here (later steps would be contaminated by its backlog).")
+                stop = True
+                break
+        if stop:
             break
 
     return {
@@ -501,7 +511,11 @@ def main() -> int:
                              "(load + drain) and isolation comes from the drain to "
                              "zero between steps.")
     parser.add_argument("--device-count", type=int, default=20,
-                        help="Fresh devices/datasets provisioned per step.")
+                        help="Fresh devices/datasets provisioned per rep.")
+    parser.add_argument("--repetitions", type=int, default=1,
+                        help="Independent repetitions per offered load. Each rep "
+                             "provisions new datasets and drains to zero, so reps are "
+                             "isolated; the plots average over them.")
     parser.add_argument("--invalid-ratio", type=float, default=0.0,
                         help="Fraction of invalid (DLQ-bound) messages. Default 0 "
                              "(pure valid) so offered load == expected goodput.")
@@ -540,6 +554,8 @@ def main() -> int:
 
     if not 0.0 <= args.invalid_ratio <= 1.0:
         raise SystemExit("--invalid-ratio must be between 0.0 and 1.0")
+    if args.repetitions < 1:
+        raise SystemExit("--repetitions must be >= 1")
     if args.steps != sorted(args.steps):
         print("[warn] steps are not ascending; the ramp assumes increasing "
               "offered load.")

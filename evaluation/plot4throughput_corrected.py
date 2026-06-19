@@ -104,6 +104,34 @@ def plot(rows: list[dict[str, float]], out: Path) -> None:
     print(f"Wrote {out}")
 
 
+def plot_single(rows: list[dict[str, float]], out: Path) -> None:
+    """Single-curve preview: end-to-end (CKAN) throughput vs offered load."""
+    xs = [r["input"] for r in rows]
+    ys = [r["t4"] for r in rows]
+    lim = max(xs) if xs else 1.0
+    ymax = max(max(ys), lim)
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+    ax.plot([0, lim], [0, lim], linestyle=(0, (5, 4)), color="#999999",
+            linewidth=1.2, label="ideal (y = x)", zorder=1)
+    ax.plot(xs, ys, marker="D", color="#d62728", linewidth=2.0, markersize=7,
+            label="end-to-end throughput (CKAN)", zorder=3)
+    ax.set_xlim(0, lim * 1.02)
+    ax.set_ylim(0, ymax * 1.08)
+    ax.set_xlabel("Offered load (msg/s)")
+    ax.set_ylabel("Throughput (msg/s)")
+    ax.set_title("end-to-end throughput vs offered load  (PREVIEW, approx)",
+                 fontsize=12)
+    ax.legend(loc="upper left", frameon=True, fontsize=9)
+    ax.grid(True, linestyle=":", alpha=0.4)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    print(f"Wrote {out}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--results-dir", type=Path,
@@ -115,6 +143,7 @@ def main() -> int:
     fig_dir = args.results_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
     plot(rows, fig_dir / "throughput4_vs_offered_load_corrected.png")
+    plot_single(rows, fig_dir / "end_to_end_throughput_corrected_preview.png")
 
     print("\noffered  input    T1     T2     T3     T4(new)  T4(old)")
     for r in rows:
