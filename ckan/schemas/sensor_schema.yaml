@@ -126,22 +126,22 @@ dataset_fields:
 
   - field_name: dataset_uuid
     label: Dataset UUID
-    help_text: Persistent global identifier (FAIR F1).
+    help_text: Persistent global identifier.
     validators: ignore_missing unicode_safe
 
   - field_name: sosa_sensor_uri
     label: SOSA Sensor URI
-    help_text: W3C SSN/SOSA class URI describing this sensor (FAIR I2).
+    help_text: W3C SSN/SOSA class URI.
     validators: ignore_missing unicode_safe
 
   - field_name: sosa_observable_property_uri
     label: Observable Property URI
-    help_text: QUDT QuantityKind URI for the primary measurand (FAIR I2).
+    help_text: QUDT QuantityKind URI.
     validators: ignore_missing unicode_safe
 
   - field_name: qudt_unit_uri
     label: QUDT Unit URI
-    help_text: Standardised unit-of-measure URI (FAIR I2).
+    help_text: Standardised unit of measure URI.
     validators: ignore_missing unicode_safe
 
   - field_name: created_at_iso
@@ -154,7 +154,7 @@ dataset_fields:
 
   - field_name: provenance_json
     label: Provenance (PROV-JSON)
-    help_text: W3C PROV-O lineage of enrichment activities (FAIR R1.2).
+    help_text: W3C PROV-O lineage of enrichment activities.
     validators: ignore_missing unicode_safe
 
 resource_fields:
