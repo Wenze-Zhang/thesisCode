@@ -24,10 +24,10 @@ X_LABEL = "Offered load (msg/s)"
 # (csv column, legend label, colour, marker) -- colours/markers match the
 # reference thesis figure (raw highest, ckan lowest = end-to-end bottleneck).
 CURVES = [
-    ("throughput_t1_raw_msg_s", "T1 ingest (raw)", "#2ca02c", "o"),
-    ("throughput_t2_validated_msg_s", "T2 validate (validated)", "#1f77b4", "s"),
-    ("throughput_t3_csv_msg_s", "T3 export (CSV)", "#9467bd", "^"),
-    ("throughput_t4_ckan_msg_s", "T4 publish (CKAN, end-to-end)", "#d62728", "D"),
+    ("throughput_t1_raw_msg_s", "T1", "#2ca02c", "o"),
+    ("throughput_t2_validated_msg_s", "T2", "#1f77b4", "s"),
+    ("throughput_t3_csv_msg_s", "T3", "#9467bd", "^"),
+    ("throughput_t4_ckan_msg_s", "T4", "#d62728", "D"),
 ]
 
 
@@ -98,10 +98,7 @@ def plot_throughput4(rows, out: Path) -> None:
     ax.set_ylim(0, ymax * 1.08)
     ax.set_xlabel(X_LABEL)
     ax.set_ylabel("Throughput (msg/s)")
-    title = "throughput vs offered load"
-    if reps > 1:
-        title += f"  (mean of {reps} reps)"
-    ax.set_title(title, fontsize=12)
+    ax.set_title("throughput vs offered load", fontsize=12)
     ax.legend(loc="upper left", frameon=True, fontsize=9)
     ax.grid(True, linestyle=":", alpha=0.4)
     for spine in ("top", "right"):
