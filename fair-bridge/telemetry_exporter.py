@@ -7,7 +7,9 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -32,6 +34,27 @@ logging.getLogger("kafka").setLevel(logging.WARNING)
 
 BASE_COLUMNS = ["ts", "device_name", "device_id", "sensor_type", "quality"]
 CANONICALIZED_COLUMN = "canonicalized"
+
+# Parallel CKAN uploads per flush. Uploads run on a background thread (off the
+# Kafka consume path) and fan out across this many workers.
+UPLOAD_WORKERS = max(1, int(os.getenv("EXPORT_UPLOAD_WORKERS", "6")))
+
+# One RemoteCKAN client per worker thread. RemoteCKAN wraps a `requests` session
+# (not thread-safe to share), and construction is network-free, so a thread-local
+# instance is both correct and cheap.
+_thread_local = threading.local()
+
+
+def _ckan_client() -> RemoteCKAN:
+    client = getattr(_thread_local, "ckan", None)
+    if client is None:
+        client = RemoteCKAN(
+            config.CKAN_URL,
+            apikey=config.CKAN_API_KEY,
+            user_agent="fair-bridge-telemetry-exporter/1.0",
+        )
+        _thread_local.ckan = client
+    return client
 
 
 # Keep this logic in sync with enricher.slugify(); CKAN dataset names must match.
@@ -256,11 +279,11 @@ def _existing_resource(dataset: dict[str, Any], resource_name: str) -> dict[str,
 
 
 def upload_csv_to_ckan(
-    ckan: RemoteCKAN,
     dataset_slug: str,
     day: str,
     csv_path: Path,
 ) -> bool:
+    ckan = _ckan_client()
     try:
         dataset = ckan.action.package_show(id=dataset_slug)
     except NotFound:
@@ -304,19 +327,53 @@ def upload_csv_to_ckan(
 
 
 def flush_dirty_csvs(
-    ckan: RemoteCKAN,
     dirty: set[tuple[str, str, Path]],
+    max_workers: int = UPLOAD_WORKERS,
 ) -> set[tuple[str, str, Path]]:
+    """Upload the given dirty CSVs to CKAN in parallel; return the ones that failed."""
+    items = [item for item in dirty if item[2].exists()]
+    if not items:
+        return set()
     remaining: set[tuple[str, str, Path]] = set()
-    for dataset_slug, day, csv_path in sorted(
-        dirty,
-        key=lambda item: (item[0], item[1], str(item[2])),
-    ):
-        if not csv_path.exists():
-            continue
-        if not upload_csv_to_ckan(ckan, dataset_slug, day, csv_path):
-            remaining.add((dataset_slug, day, csv_path))
+    workers = max(1, min(max_workers, len(items)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        future_to_item = {
+            pool.submit(upload_csv_to_ckan, slug, day, path): (slug, day, path)
+            for slug, day, path in items
+        }
+        for future in as_completed(future_to_item):
+            item = future_to_item[future]
+            try:
+                ok = future.result()
+            except Exception:
+                log.exception("Upload task crashed for %s", item)
+                ok = False
+            if not ok:
+                remaining.add(item)
     return remaining
+
+
+def uploader_loop(
+    dirty: set[tuple[str, str, Path]],
+    lock: threading.Lock,
+    stop: threading.Event,
+    flush_interval: float,
+) -> None:
+
+
+    last_flush = 0.0
+    while not stop.is_set():
+        if time.time() - last_flush >= flush_interval:
+            with lock:
+                claimed = set(dirty)
+                dirty.clear()
+            if claimed:
+                remaining = flush_dirty_csvs(claimed)
+                if remaining:
+                    with lock:
+                        dirty |= remaining
+            last_flush = time.time()
+        stop.wait(0.5)
 
 
 def main() -> int:
@@ -336,62 +393,62 @@ def main() -> int:
     export_dir.mkdir(parents=True, exist_ok=True)
 
     wait_for_ckan(config.CKAN_URL, config.CKAN_READY_TIMEOUT_S)
-    ckan = RemoteCKAN(
-        config.CKAN_URL,
-        apikey=config.CKAN_API_KEY,
-        user_agent="fair-bridge-telemetry-exporter/1.0",
-    )
     consumer = wait_for_kafka(config.KAFKA_BOOTSTRAP_SERVERS, config.KAFKA_READY_TIMEOUT_S)
 
-    dirty = discover_pending_csvs(export_dir)
+    # dirty is shared between the consume loop (producer) and the uploader
+    dirty: set[tuple[str, str, Path]] = discover_pending_csvs(export_dir)
     if dirty:
         log.info("Found %d pending CSV export(s) on disk.", len(dirty))
 
-    last_flush = 0.0
     flush_interval = max(1, config.EXPORT_FLUSH_INTERVAL_S)
     header_cache: dict[Path, list[str]] = {}
+    lock = threading.Lock()
+    stop = threading.Event()
+    uploader = threading.Thread(
+        target=uploader_loop, args=(dirty, lock, stop, flush_interval), daemon=True
+    )
+    uploader.start()
+    log.info("Uploader thread started (flush %ss, %d workers).", flush_interval, UPLOAD_WORKERS)
 
-    while True:
-        try:
-            records = consumer.poll(timeout_ms=1000, max_records=100)
-        except Exception:
-            log.exception("Kafka poll failed.")
-            time.sleep(2)
-            continue
+    try:
+        while True:
+            try:
+                records = consumer.poll(timeout_ms=1000, max_records=100)
+            except Exception:
+                log.exception("Kafka poll failed.")
+                time.sleep(2)
+                continue
 
-        # Commit once per poll instead of once per message. Per partition we
-        # advance the commit offset only up to the last contiguous success, so
-        # a CSV write failure leaves that message uncommitted and reread on restart (at least once).
-        offsets_to_commit: dict[TopicPartition, OffsetAndMetadata] = {}
-        for tp, batch in records.items():
-            for msg in batch:
+
+            offsets_to_commit: dict[TopicPartition, OffsetAndMetadata] = {}
+            for tp, batch in records.items():
+                for msg in batch:
+                    try:
+                        dataset_slug, day, csv_path = append_telemetry_to_csv(
+                            msg.value or {}, export_dir, header_cache
+                        )
+                        with lock:
+                            dirty.add((dataset_slug, day, csv_path))
+                    except Exception:
+                        log.exception(
+                            "Failed to write CSV for Kafka offset %s on %s; "
+                            "not committing past it",
+                            msg.offset,
+                            tp,
+                        )
+                        break
+                    offsets_to_commit[tp] = OffsetAndMetadata(msg.offset + 1, None)
+
+            if offsets_to_commit:
                 try:
-                    dataset_slug, day, csv_path = append_telemetry_to_csv(
-                        msg.value or {}, export_dir, header_cache
-                    )
-                    dirty.add((dataset_slug, day, csv_path))
+                    consumer.commit(offsets_to_commit)
                 except Exception:
                     log.exception(
-                        "Failed to write CSV for Kafka offset %s on %s; "
-                        "not committing past it",
-                        msg.offset,
-                        tp,
+                        "Kafka batch commit failed for %d partition(s)", len(offsets_to_commit)
                     )
-                    break
-                offsets_to_commit[tp] = OffsetAndMetadata(msg.offset + 1, None)
-
-        if offsets_to_commit:
-            try:
-                consumer.commit(offsets_to_commit)
-            except Exception:
-                log.exception(
-                    "Kafka batch commit failed for %d partition(s)", len(offsets_to_commit)
-                )
-
-        if time.time() - last_flush >= flush_interval:
-            if dirty:
-                dirty = flush_dirty_csvs(ckan, dirty)
-            last_flush = time.time()
+    finally:
+        stop.set()
+        uploader.join(timeout=flush_interval + 30)
 
 
 if __name__ == "__main__":
