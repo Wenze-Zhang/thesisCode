@@ -315,6 +315,12 @@ services:
       CKAN_ORG: acs-eonerc
       EXPORT_DIR: /app/exports
       EXPORT_FLUSH_INTERVAL_S: "30"
+      # Parallel CKAN uploads per flush. CKAN runs uWSGI with -p 2, so the real ceiling
+      # is low; 12 keeps both CKAN workers + upload I/O saturated and makes the final
+      # drain flush ~1-2 waves instead of ~4. Raise CKAN's -p first if more is needed.
+      EXPORT_UPLOAD_WORKERS: "12"
+      # Idle/drain-triggered flushes fire at most this often (collapses the drain tail).
+      EXPORT_MIN_FLUSH_GAP_S: "2"
     volumes:
       - ./fair-bridge/registry:/app/registry:ro
       - telemetry_exports:/app/exports

@@ -39,6 +39,13 @@ CANONICALIZED_COLUMN = "canonicalized"
 # Kafka consume path) and fan out across this many workers.
 UPLOAD_WORKERS = max(1, int(os.getenv("EXPORT_UPLOAD_WORKERS", "6")))
 
+# When the consume loop catches up (an empty poll) and CSVs are still pending, the
+# uploader flushes immediately instead of waiting out the full flush interval -- this
+# is what collapses the benchmark's drain tail. Rate-limit those idle-triggered flushes
+# to at most one per MIN_FLUSH_GAP_S so a bursty steady-state load can't trigger an
+# excessive number of whole-file re-uploads.
+MIN_FLUSH_GAP_S = max(0.0, float(os.getenv("EXPORT_MIN_FLUSH_GAP_S", "2")))
+
 # One RemoteCKAN client per worker thread. RemoteCKAN wraps a `requests` session
 # (not thread-safe to share), and construction is network-free, so a thread-local
 # instance is both correct and cheap.
@@ -334,6 +341,13 @@ def flush_dirty_csvs(
     items = [item for item in dirty if item[2].exists()]
     if not items:
         return set()
+    started = time.perf_counter()
+    total_bytes = 0
+    for _slug, _day, path in items:
+        try:
+            total_bytes += path.stat().st_size
+        except OSError:
+            pass
     remaining: set[tuple[str, str, Path]] = set()
     workers = max(1, min(max_workers, len(items)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -350,6 +364,14 @@ def flush_dirty_csvs(
                 ok = False
             if not ok:
                 remaining.add(item)
+    # Per-flush timing: how long the whole flush took, how much was uploaded, and how
+    # many files still failed. Used to verify the drain-tail fix (see the throughput
+    # benchmark) -- under load this stays bounded; on drain it should be small and fast.
+    log.info(
+        "Flush done: %d file(s), %.1f KiB, %d worker(s) in %.2fs (%d still pending)",
+        len(items), total_bytes / 1024.0, workers,
+        time.perf_counter() - started, len(remaining),
+    )
     return remaining
 
 
@@ -358,12 +380,25 @@ def uploader_loop(
     lock: threading.Lock,
     stop: threading.Event,
     flush_interval: float,
+    flush_now: threading.Event,
 ) -> None:
+    """Flush pending CSVs to CKAN, event-driven.
 
-
-    last_flush = 0.0
+    Two triggers:
+      * periodic   -- at most every `flush_interval` (staleness cap, keeps steady-state
+                      whole-file re-uploads bounded under sustained load);
+      * idle/drain -- `flush_now` set by the consume loop when it catches up, rate-limited
+                      to one per MIN_FLUSH_GAP_S. This is what collapses the benchmark's
+                      drain tail: once the backlog is gone the last rows go out in ~seconds
+                      instead of waiting the full flush_interval.
+    """
+    last_flush = time.time()
     while not stop.is_set():
-        if time.time() - last_flush >= flush_interval:
+        since = time.time() - last_flush
+        due_periodic = since >= flush_interval
+        due_idle = flush_now.is_set() and since >= MIN_FLUSH_GAP_S
+        if due_periodic or due_idle:
+            flush_now.clear()
             with lock:
                 claimed = set(dirty)
                 dirty.clear()
@@ -373,7 +408,14 @@ def uploader_loop(
                     with lock:
                         dirty |= remaining
             last_flush = time.time()
-        stop.wait(0.5)
+            continue
+        # Sleep until the next possible flush decision, waking early on a fresh signal.
+        # Event.wait() returns immediately if already set, so ride out the min-gap window
+        # with the (interruptible) stop event instead to avoid a busy loop.
+        if flush_now.is_set():
+            stop.wait(max(0.05, MIN_FLUSH_GAP_S - since))
+        else:
+            flush_now.wait(min(0.5, max(0.05, flush_interval - since)))
 
 
 def main() -> int:
@@ -404,11 +446,19 @@ def main() -> int:
     header_cache: dict[Path, list[str]] = {}
     lock = threading.Lock()
     stop = threading.Event()
+    # Set by the consume loop when it has caught up (empty poll) so the uploader flushes
+    # pending CSVs immediately instead of waiting the full flush interval.
+    flush_now = threading.Event()
     uploader = threading.Thread(
-        target=uploader_loop, args=(dirty, lock, stop, flush_interval), daemon=True
+        target=uploader_loop,
+        args=(dirty, lock, stop, flush_interval, flush_now),
+        daemon=True,
     )
     uploader.start()
-    log.info("Uploader thread started (flush %ss, %d workers).", flush_interval, UPLOAD_WORKERS)
+    log.info(
+        "Uploader thread started (flush cap %ss, idle-flush gap %ss, %d workers).",
+        flush_interval, MIN_FLUSH_GAP_S, UPLOAD_WORKERS,
+    )
 
     try:
         while True:
@@ -446,6 +496,15 @@ def main() -> int:
                     log.exception(
                         "Kafka batch commit failed for %d partition(s)", len(offsets_to_commit)
                     )
+
+            # Empty poll => consumer has caught up. If CSVs are still pending, ask the
+            # uploader to flush now rather than wait out the flush interval; under load
+            # polls are rarely empty, so steady-state flush cadence stays at flush_interval.
+            if not records:
+                with lock:
+                    has_pending = bool(dirty)
+                if has_pending:
+                    flush_now.set()
     finally:
         stop.set()
         uploader.join(timeout=flush_interval + 30)
