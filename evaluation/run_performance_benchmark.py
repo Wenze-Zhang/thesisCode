@@ -48,6 +48,7 @@ import shutil
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -618,8 +619,8 @@ def _ckan_poller(
 ) -> None:
     """Watch each dataset's daily resource last_modified.
 
-    * Per-message: stamp t_ckan when the covering resource's last_modified first
-      reaches a row's t_csv (the flush carrying that row has completed).
+    * Per-message: stamp t_ckan = that resource's last_modified once it first reaches a
+      row's t_csv (so t_ckan is CKAN's real publish time, free of poll-detection latency).
     * Batch-level: when a resource's last_modified advances, record
       (last_modified - csv_mtime_from_previous_poll) as the CSV->CKAN batch lag.
     """
@@ -631,10 +632,22 @@ def _ckan_poller(
             resources = {
                 (e.dataset_slug, e.day, e.device_name) for e in events.values()
             }
-        # One package_show per dataset; each (slug, day) maps to one resource.
+        # Fetch every dataset's package metadata CONCURRENTLY. Serial package_show made
+        # one poll cycle take ~20 round-trips, which coarsened t_ckan; in parallel a
+        # cycle is ~one round-trip, so detection keeps up with the ~2s drain flushes and
+        # the sampled last_modified is the covering flush's (not a later one).
+        slug_list = list({slug for slug, _, _ in resources})
+        results: dict[str, Any] = {}
+        if slug_list:
+            with ThreadPoolExecutor(max_workers=min(len(slug_list), 16)) as pool:
+                fetched = pool.map(
+                    lambda s: _ckan_package_show(ckan_url, api_key, s), slug_list
+                )
+                results = dict(zip(slug_list, fetched))
+
         lm_by_resource: dict[tuple[str, str], float | None] = {}
-        for slug in {slug for slug, _, _ in resources}:
-            result = _ckan_package_show(ckan_url, api_key, slug)
+        for slug in slug_list:
+            result = results.get(slug)
             lm_by_name = {}
             if result:
                 for resource in result.get("resources") or []:
@@ -658,15 +671,18 @@ def _ckan_poller(
                     batch_latencies_s.append(max(0.0, lm - prev_mtime))
                 prev[key] = (lm, csv_mtime)
 
-        # Single locked pass: stamp t_ckan once the covering resource is published.
-        now = time.time()
+        # Stamp t_ckan with the resource's REAL publish time (CKAN last_modified), NOT the
+        # poll-detection time. last_modified is CKAN's own server timestamp of when the
+        # flush carrying this row completed; using it removes the poller's sleep + round
+        # trip from the measurement, so T4's makespan reflects the true CSV->CKAN publish
+        # time. (CKAN and the benchmark share the Docker host clock, so skew is negligible.)
         with lock:
             for event in events.values():
                 if event.t_csv is None or event.t_ckan is not None:
                     continue
                 lm = lm_by_resource.get((event.dataset_slug, event.day))
                 if lm is not None and lm >= event.t_csv:
-                    event.t_ckan = now
+                    event.t_ckan = lm
         if stop_event.wait(poll_interval_s):
             break
 
