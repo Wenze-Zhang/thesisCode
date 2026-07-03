@@ -162,17 +162,23 @@ def main() -> int:
         group_id=config.KAFKA_CONSUMER_GROUP_ETL,
         auto_offset_reset="latest",
         enable_auto_commit=True,
+        # Pull more records per fetch under saturation to amortise the per-poll
+        # Python/kafka-python overhead (default is 500).
+        max_poll_records=1000,
         # tansmit from JSON bytes to Python dict
         value_deserializer=lambda value: json.loads(value.decode("utf-8")) if value else {},
     )
-    
-    
+
+
     producer = KafkaProducer(
         bootstrap_servers=config.KAFKA_BOOTSTRAP_SERVERS,
         # transmit from Python dict to JSON bytes
         value_serializer=lambda value: json.dumps(value, ensure_ascii=False).encode("utf-8"),
         linger_ms=20,
         acks="all",
+        # Larger batches (default 16 KB) mean fewer, fuller produce requests to the
+        # broker under load -- fewer sender-thread wakeups / round-trips per message.
+        batch_size=131072,
     )
 
     log.info("ETL listening on '%s' ...", config.KAFKA_TOPIC_TELEMETRY_RAW)

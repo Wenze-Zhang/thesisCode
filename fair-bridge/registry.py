@@ -3,8 +3,8 @@ from __future__ import annotations
 import os
 from typing import Any, Iterable
 import yaml
-from jsonschema import Draft202012Validator
-from jsonschema.exceptions import ValidationError as JsonValidationError
+import fastjsonschema
+from fastjsonschema.exceptions import JsonSchemaValueException
 
 
 _JSON_TYPE = {
@@ -78,12 +78,18 @@ class Registry:
                     self._register_alias(str(alias), field_name)
 
 
-        # build JSON schemas and validators for each sensor type
+        # build JSON schemas and validators for each sensor type. fastjsonschema
+        # COMPILES each schema into a plain Python function once at startup (vs
+        # jsonschema's interpreted per-node walk), which is the dominant per-message
+        # ETL CPU cost -- ~55% of process_message, see evaluation/profile_etl.py.
         self.raw_schemas = self._build_schemas()    # JSON schemas dict for each sensor type
         self.validators = {
-            sensor_type: Draft202012Validator(schema)
+            sensor_type: fastjsonschema.compile(schema)
             for sensor_type, schema in self.raw_schemas.items()
         }
+        # device_name.lower() -> sensor_type memo; classify() rescans every alias
+        # otherwise, and the device set is tiny + highly repetitive in the stream.
+        self._classify_cache: dict[str, str] = {}
 
     def _register_alias(self, token: str, canonical: str) -> None:
         
@@ -160,22 +166,32 @@ class Registry:
     # classification of device type by name
     def classify(self, device_name: str) -> str:
         name = (device_name or "").lower()
+        cached = self._classify_cache.get(name)
+        if cached is not None:
+            return cached
+        result = "other"
         for sensor_type, aliases in self._name_aliases:
             if any(alias and alias in name for alias in aliases):
-                return sensor_type
-        return "other"
+                result = sensor_type
+                break
+        self._classify_cache[name] = result
+        return result
 
 
-    # validation with JSON schema
+    # validation with JSON schema (fastjsonschema-compiled validator)
     def validate(self, values: dict, sensor_type: str) -> str | None:
         validator = self.validators.get(sensor_type)
         if validator is None:
             return f"no schema for sensor_type={sensor_type!r}"
         try:
-            validator.validate(values)
+            validator(values)
             return None
-        except JsonValidationError as exc:
-            path = "/".join(str(part) for part in exc.absolute_path) or "<root>"
+        except JsonSchemaValueException as exc:
+            # exc.path is like ["data", "<field>", ...]; drop the leading "data"
+            # synthetic root so the reported path stays the offending field name,
+            # matching the previous "<path>: <message>" DLQ error shape.
+            parts = list(exc.path)[1:]
+            path = "/".join(str(part) for part in parts) or "<root>"
             return f"{path}: {exc.message}"
 
 

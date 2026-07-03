@@ -4,8 +4,10 @@ kafka-python==2.0.2
 # CKAN REST API client
 ckanapi==4.7
 
-# JSON Schema validation for ETL pipeline
-jsonschema==4.21.1
+# JSON Schema validation for ETL pipeline. fastjsonschema COMPILES each schema to
+# a Python function at startup (vs jsonschema's interpreted per-node walk), which
+# was ~55% of the per-message ETL CPU cost -- see evaluation/profile_etl.py.
+fastjsonschema==2.21.2
 
 # YAML parsing for the canonical field registry (single source of truth)
 PyYAML==6.0.1
