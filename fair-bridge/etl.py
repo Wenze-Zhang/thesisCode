@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import json
 import logging
 import sys
 import time
 from datetime import datetime, timezone
 from typing import Any
+
+import orjson
 
 import config
 import registry
@@ -165,15 +166,16 @@ def main() -> int:
         # Pull more records per fetch under saturation to amortise the per-poll
         # Python/kafka-python overhead (default is 500).
         max_poll_records=1000,
-        # tansmit from JSON bytes to Python dict
-        value_deserializer=lambda value: json.loads(value.decode("utf-8")) if value else {},
+        # tansmit from JSON bytes to Python dict (orjson: C parser, accepts bytes)
+        value_deserializer=lambda value: orjson.loads(value) if value else {},
     )
 
 
     producer = KafkaProducer(
         bootstrap_servers=config.KAFKA_BOOTSTRAP_SERVERS,
-        # transmit from Python dict to JSON bytes
-        value_serializer=lambda value: json.dumps(value, ensure_ascii=False).encode("utf-8"),
+        # transmit from Python dict to JSON bytes (orjson emits UTF-8 bytes
+        # directly, same semantics as ensure_ascii=False + encode)
+        value_serializer=orjson.dumps,
         linger_ms=20,
         acks="all",
         # Larger batches (default 16 KB) mean fewer, fuller produce requests to the

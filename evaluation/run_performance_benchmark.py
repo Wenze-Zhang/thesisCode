@@ -458,6 +458,21 @@ def _name_and_ts(value: dict, headers: dict) -> tuple[str, int | None]:
     return str(name), _canonical_ts_ms(raw_ts)
 
 
+def _record_time(record, fallback: float) -> float:
+    """Intrinsic Kafka log timestamp (epoch seconds) of a record: WHEN the message
+    actually landed in its topic (set by the producer/broker), NOT when this
+    (possibly backlogged) observer got around to polling it. Stamping stages with
+    this instead of the observation wall-clock decouples a stage's makespan from
+    the OBSERVER's own throughput -- the same reason t_ckan uses CKAN's
+    last_modified rather than the poll-detection time. Without it, a slow in-process
+    observer (4 threads sharing one GIL) drags max(t_stage) past the true completion
+    at high load, deflating the makespan rate even though every message arrived and
+    drained (a pure measurement artifact). Falls back to the observation time when
+    the broker supplied no usable timestamp (kafka-python reports -1)."""
+    ts = getattr(record, "timestamp", None)
+    return ts / 1000.0 if ts is not None and ts > 0 else fallback
+
+
 def _kafka_observer(
     consumer,
     topic: str,
@@ -467,7 +482,9 @@ def _kafka_observer(
     stop_event: threading.Event,
     sample_box: dict[str, Any],
 ) -> None:
-    """Stamp first-sighting wall time for raw / validated / dlq stages."""
+    """Stamp each raw / validated / dlq stage with the message's intrinsic Kafka
+    log timestamp (see _record_time), so the stage throughput is observer-speed
+    independent. `seen` is only the fallback when the broker omitted a timestamp."""
     while not stop_event.is_set():
         polled = consumer.poll(timeout_ms=200, max_records=2000)
         if not polled:
@@ -489,13 +506,13 @@ def _kafka_observer(
                         continue
                     if stage == "raw":
                         if event.t_raw is None:
-                            event.t_raw = seen
+                            event.t_raw = _record_time(record, seen)
                     elif stage == "validated":
                         if event.t_validated is None:
-                            event.t_validated = seen
+                            event.t_validated = _record_time(record, seen)
                     elif stage == "dlq":
                         if event.t_dlq is None:
-                            event.t_dlq = seen
+                            event.t_dlq = _record_time(record, seen)
 
 
 # --------------------------------------------------------------------------- #
@@ -517,7 +534,9 @@ def _csv_tailer(
     stop_event: threading.Event,
     scan_interval_s: float,
 ) -> None:
-    """Tail per-device daily CSVs and stamp t_csv on first sighting of each row.
+    """Tail per-device daily CSVs and stamp t_csv with the file's flush mtime on
+    first sighting of each row (see _drain_csv: intrinsic exporter-write time, not
+    the tailer's scan time).
 
     Reads only newly appended bytes; on a full-file rewrite (size shrank, which
     the exporter does when the header changes) it re-reads from the header.
@@ -539,7 +558,7 @@ def _csv_tailer(
                 cursor.header = None
             cursor.size = stat.st_size
             try:
-                _drain_csv(csv_path, cursor, events, lock)
+                _drain_csv(csv_path, cursor, events, lock, stat.st_mtime)
             except Exception:
                 # Best-effort tailer: a transient partial read must not kill it.
                 continue
@@ -552,6 +571,7 @@ def _drain_csv(
     cursor: _CsvCursor,
     events: dict[tuple[str, int], Event],
     lock: threading.Lock,
+    mtime: float,
 ) -> None:
     with csv_path.open("r", newline="", encoding="utf-8") as fh:
         if cursor.header is None:
@@ -570,7 +590,11 @@ def _drain_csv(
         return
     complete = chunk[: last_newline + 1]
     cursor.offset += len(complete.encode("utf-8"))
-    seen = time.time()
+    # Stamp t_csv with the CSV file's mtime (when the exporter FLUSHED these rows),
+    # not this tailer's scan time -- decouples T3's makespan from the tailer's own
+    # scan lateness. These are the freshly-appended rows, so the file's mtime is the
+    # flush that wrote them; the makespan uses max(t_csv), i.e. the last flush, which
+    # this captures exactly. (Mirrors t_ckan=last_modified and t_raw/t_validated=record ts.)
     reader = csv.DictReader(io.StringIO(complete), fieldnames=cursor.header)
     with lock:
         for row in reader:
@@ -580,7 +604,7 @@ def _drain_csv(
                 continue
             event = events.get((name, ts_ms))
             if event is not None and event.t_csv is None:
-                event.t_csv = seen
+                event.t_csv = mtime
 
 
 # --------------------------------------------------------------------------- #

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import csv
-import json
 import logging
 import os
 import re
@@ -14,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import orjson
 import requests
 from ckanapi import RemoteCKAN
 from ckanapi.errors import NotFound
@@ -38,6 +38,11 @@ CANONICALIZED_COLUMN = "canonicalized"
 # Parallel CKAN uploads per flush. Uploads run on a background thread (off the
 # Kafka consume path) and fan out across this many workers.
 UPLOAD_WORKERS = max(1, int(os.getenv("EXPORT_UPLOAD_WORKERS", "6")))
+
+# Records pulled per Kafka poll. Rows are grouped by target CSV and batch-written
+# once per file per poll, so a bigger poll directly amortises both the poll
+# round-trip and the file open/close cost (100 was far too small under load).
+MAX_POLL_RECORDS = max(1, int(os.getenv("EXPORT_MAX_POLL_RECORDS", "1000")))
 
 # When the consume loop catches up (an empty poll) and CSVs are still pending, the
 # uploader flushes immediately instead of waiting out the full flush interval -- this
@@ -103,7 +108,7 @@ def wait_for_kafka(bootstrap: str, timeout: int) -> KafkaConsumer:
                 group_id=config.KAFKA_CONSUMER_GROUP_EXPORTER,
                 auto_offset_reset="earliest",
                 enable_auto_commit=False,
-                value_deserializer=lambda value: json.loads(value.decode("utf-8")) if value else {},
+                value_deserializer=lambda value: orjson.loads(value) if value else {},
             )
             log.info("Kafka ready; subscribed to %s", config.KAFKA_TOPIC_TELEMETRY_VALIDATED)
             return consumer
@@ -123,10 +128,10 @@ def telemetry_date(ts_value: Any) -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
-# cell value for CSV
+# cell value for CSV (orjson emits UTF-8 bytes; decode back to str for csv)
 def _cell_value(value: Any) -> Any:
     if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        return orjson.dumps(value, option=orjson.OPT_SORT_KEYS).decode("utf-8")
     return value
 
 
@@ -135,7 +140,7 @@ def _canonicalized_value(value: Any) -> str:
         return ""
     if isinstance(value, str):
         return value
-    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return orjson.dumps(value, option=orjson.OPT_SORT_KEYS).decode("utf-8")
 
 # row normalization 
 def _normalise_row(row: dict[str, Any], fieldnames: list[str]) -> dict[str, Any]:
@@ -172,26 +177,34 @@ def _read_header(csv_path: Path) -> list[str]:
             return []
 
 
-def _append_or_rewrite_csv(
+def _write_rows_to_csv(
     csv_path: Path,
-    row: dict[str, Any],
-    incoming_value_keys: list[str],
+    rows: list[tuple[dict[str, Any], list[str]]],
     header_cache: dict[Path, list[str]],
 ) -> None:
+    """Write a batch of (row, incoming_value_keys) to one CSV, opening the file at
+    most once for the whole batch. This replaces the old per-row append: at several
+    thousand msg/s the per-row open/write/close syscalls dominated the consume loop
+    (T3), so the poll loop now groups rows by target file and calls this once per
+    file per poll. Header evolution is folded across the whole batch first; if the
+    final header matches the on-disk one the batch is appended with one writerows,
+    otherwise the file is rewritten once (not once per row)."""
     # Cache each file's header so the steady-state path never re-reads the file;
     # the exporter is the sole writer, so the cache stays consistent with disk.
     existing_fieldnames = header_cache.get(csv_path)
     if existing_fieldnames is None:
         existing_fieldnames = _read_header(csv_path)
 
-    fieldnames = _fieldnames_for(existing_fieldnames, incoming_value_keys)
+    fieldnames = existing_fieldnames
+    for _row, incoming_value_keys in rows:
+        fieldnames = _fieldnames_for(fieldnames, incoming_value_keys)
     file_has_data = csv_path.exists() and csv_path.stat().st_size > 0
 
-    # Fast path: header unchanged -> append one row, no full-file read.
+    # Fast path: header unchanged -> append the whole batch, no full-file read.
     if file_has_data and fieldnames == existing_fieldnames:
         with csv_path.open("a", newline="", encoding="utf-8") as fh:
             writer = csv.DictWriter(fh, fieldnames=fieldnames)
-            writer.writerow(_normalise_row(row, fieldnames))
+            writer.writerows(_normalise_row(row, fieldnames) for row, _ in rows)
         header_cache[csv_path] = fieldnames
         return
 
@@ -206,18 +219,19 @@ def _append_or_rewrite_csv(
     with tmp_path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
-        for existing_row in existing_rows:
-            writer.writerow(_normalise_row(existing_row, fieldnames))
-        writer.writerow(_normalise_row(row, fieldnames))
+        writer.writerows(_normalise_row(existing_row, fieldnames) for existing_row in existing_rows)
+        writer.writerows(_normalise_row(row, fieldnames) for row, _ in rows)
     os.replace(tmp_path, csv_path)
     header_cache[csv_path] = fieldnames
 
 # dynamic CSV header management
-def append_telemetry_to_csv(
+def _parse_payload(
     payload: dict[str, Any],
     export_dir: Path,
-    header_cache: dict[Path, list[str]],
-) -> tuple[str, str, Path]:
+) -> tuple[str, str, Path, dict[str, Any], list[str]]:
+    """Pure parse step (no I/O): map one validated payload to its target CSV path
+    plus the row to write. Split out of append_telemetry_to_csv so the poll loop
+    can group rows by file and batch-write them."""
     device_name = str(
         payload.get("device_name")
         or payload.get("deviceName")
@@ -230,7 +244,6 @@ def append_telemetry_to_csv(
     day = telemetry_date(ts_value)
     dataset_slug = dataset_slug_for_device(device_name)
     csv_path = export_dir / dataset_slug / f"{day}.csv"
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
 
     values = payload.get("values")
     if not isinstance(values, dict):
@@ -247,9 +260,19 @@ def append_telemetry_to_csv(
     for key, value in values.items():
         row[str(key)] = _cell_value(value)
     row[CANONICALIZED_COLUMN] = _canonicalized_value(payload.get(CANONICALIZED_COLUMN))
+    return dataset_slug, day, csv_path, row, incoming_value_keys
 
-    _append_or_rewrite_csv(csv_path, row, incoming_value_keys, header_cache)
-    log.debug("CSV append <- device=%s date=%s path=%s", device_name, day, csv_path)
+
+def append_telemetry_to_csv(
+    payload: dict[str, Any],
+    export_dir: Path,
+    header_cache: dict[Path, list[str]],
+) -> tuple[str, str, Path]:
+    """Single-payload convenience wrapper (parse + write one row)."""
+    dataset_slug, day, csv_path, row, incoming_value_keys = _parse_payload(payload, export_dir)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_rows_to_csv(csv_path, [(row, incoming_value_keys)], header_cache)
+    log.debug("CSV append <- device=%s date=%s path=%s", payload.get("device_name"), day, csv_path)
     return dataset_slug, day, csv_path
 
 
@@ -463,33 +486,56 @@ def main() -> int:
     try:
         while True:
             try:
-                records = consumer.poll(timeout_ms=1000, max_records=100)
+                records = consumer.poll(timeout_ms=1000, max_records=MAX_POLL_RECORDS)
             except Exception:
                 log.exception("Kafka poll failed.")
                 time.sleep(2)
                 continue
 
-
+            # Group this poll's rows by target CSV so each file is opened once per
+            # poll (one writerows) instead of once per message -- at thousands of
+            # msg/s the per-row open/close syscalls dominated the consume loop (T3).
             offsets_to_commit: dict[TopicPartition, OffsetAndMetadata] = {}
+            groups: dict[Path, list[tuple[dict[str, Any], list[str]]]] = {}
+            group_meta: dict[Path, tuple[str, str]] = {}
             for tp, batch in records.items():
                 for msg in batch:
                     try:
-                        dataset_slug, day, csv_path = append_telemetry_to_csv(
-                            msg.value or {}, export_dir, header_cache
+                        dataset_slug, day, csv_path, row, value_keys = _parse_payload(
+                            msg.value or {}, export_dir
                         )
-                        with lock:
-                            dirty.add((dataset_slug, day, csv_path))
                     except Exception:
+                        # Malformed payload: skip it (retrying can never succeed).
                         log.exception(
-                            "Failed to write CSV for Kafka offset %s on %s; "
-                            "not committing past it",
-                            msg.offset,
-                            tp,
+                            "Unparseable payload at offset %s on %s; skipping", msg.offset, tp
                         )
-                        break
-                    offsets_to_commit[tp] = OffsetAndMetadata(msg.offset + 1, None)
+                        continue
+                    groups.setdefault(csv_path, []).append((row, value_keys))
+                    group_meta[csv_path] = (dataset_slug, day)
+                if batch:
+                    offsets_to_commit[tp] = OffsetAndMetadata(batch[-1].offset + 1, None)
 
-            if offsets_to_commit:
+            write_failed = False
+            for csv_path, rows in groups.items():
+                dataset_slug, day = group_meta[csv_path]
+                try:
+                    csv_path.parent.mkdir(parents=True, exist_ok=True)
+                    _write_rows_to_csv(csv_path, rows, header_cache)
+                except Exception:
+                    # Local-disk writes should not fail; if one does, hold the whole
+                    # poll's commit so nothing is lost (the poll is reprocessed after
+                    # a restart -- bounded duplicates, same exposure as the old
+                    # write-ok-commit-failed path).
+                    write_failed = True
+                    log.exception(
+                        "Failed to write %d row(s) to %s; not committing this poll",
+                        len(rows), csv_path,
+                    )
+                    continue
+                with lock:
+                    dirty.add((dataset_slug, day, csv_path))
+
+            if offsets_to_commit and not write_failed:
                 try:
                     consumer.commit(offsets_to_commit)
                 except Exception:

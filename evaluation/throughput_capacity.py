@@ -275,16 +275,39 @@ def _producer_process(pidx: int, nprocs: int, n_threads: int, rate: float,
             pass
 
 
-def _raw_observer_upsert(consumer, events: dict[tuple[str, int], "bench.Event"],
-                         lock: threading.Lock, stop_event: threading.Event) -> None:
-    """Raw-stage observer that UPSERTS: multi-process producers do not pre-insert
-    events, so this creates the Event on first sighting of a raw message. t_send is
-    the message's own ts (= producer send wall-clock ms); t_raw = observation time;
-    expected_validated=True (multi-process capacity mode is pure-valid). Downstream
-    observers (validated / csv / ckan) then find the event, because raw is the first
-    pipeline stage and always arrives first."""
+def _ensure_event(events: dict[tuple[str, int], "bench.Event"], name: str,
+                  ts_ms: int) -> "bench.Event":
+    """Get-or-create the Event for (name, ts_ms). Caller must hold the lock.
+    Multi-partition capacity mode is pure-valid, and every message carries its
+    send wall-clock in ts, so ANY observer can safely materialise the event on
+    first sighting -- creation order between observers no longer matters."""
+    key = (name, ts_ms)
+    event = events.get(key)
+    if event is None:
+        event = bench.Event(
+            device_name=name, ts_ms=ts_ms,
+            dataset_slug=bench.exporter.dataset_slug_for_device(name),
+            day=bench._day_for_ts_ms(ts_ms),
+            expected_validated=True, t_send=ts_ms / 1000.0,
+        )
+        events[key] = event
+    return event
+
+
+def _validated_observer_upsert(consumer, events: dict[tuple[str, int], "bench.Event"],
+                               lock: threading.Lock,
+                               stop_event: threading.Event) -> None:
+    """Validated-stage observer that UPSERTS. The plain observer only stamps
+    events the raw observer has already created ('raw always arrives first').
+    That held for the 1-partition, 1-ETL pipeline; with 8 partitions and N ETL
+    instances the validated stream can reach this benchmark BEFORE the raw
+    observer (single thread, per-message upsert under the shared lock) has
+    created the event -- a miss was dropped forever and T2-T4 counts collapsed
+    (first scaled 6000 run matched only 123078/2159996). Upserting here removes
+    the ordering assumption; t_validated stays the record's intrinsic Kafka
+    timestamp."""
     while not stop_event.is_set():
-        polled = consumer.poll(timeout_ms=200, max_records=2000)
+        polled = consumer.poll(timeout_ms=200, max_records=5000)
         if not polled:
             continue
         seen = time.time()
@@ -295,18 +318,100 @@ def _raw_observer_upsert(consumer, events: dict[tuple[str, int], "bench.Event"],
                     name, ts_ms = bench._name_and_ts(value, bench._decode_headers(record))
                     if ts_ms is None or not name:
                         continue
-                    key = (name, ts_ms)
-                    event = events.get(key)
-                    if event is None:
-                        event = bench.Event(
-                            device_name=name, ts_ms=ts_ms,
-                            dataset_slug=bench.exporter.dataset_slug_for_device(name),
-                            day=bench._day_for_ts_ms(ts_ms),
-                            expected_validated=True, t_send=ts_ms / 1000.0,
-                        )
-                        events[key] = event
+                    event = _ensure_event(events, name, ts_ms)
+                    if event.t_validated is None:
+                        event.t_validated = bench._record_time(record, seen)
+
+
+def _csv_tailer_upsert(export_dir: Path, events: dict[tuple[str, int], "bench.Event"],
+                       lock: threading.Lock, stop_event: threading.Event,
+                       scan_interval_s: float) -> None:
+    """bench._csv_tailer with the same upsert semantics as the observers above:
+    a CSV row whose event does not exist yet (raw observer still behind) is
+    materialised instead of silently skipped -- rows are read exactly once
+    (cursor-based), so a miss can never be retried."""
+    cursors: dict[Path, bench._CsvCursor] = {}
+    while not stop_event.is_set():
+        with lock:
+            wanted = {(e.dataset_slug, e.day) for e in events.values()}
+        for slug, day in wanted:
+            csv_path = export_dir / slug / f"{day}.csv"
+            try:
+                stat = csv_path.stat()
+            except FileNotFoundError:
+                continue
+            cursor = cursors.setdefault(csv_path, bench._CsvCursor())
+            if stat.st_size < cursor.size:        # rewritten -> restart
+                cursor.offset = 0
+                cursor.header = None
+            cursor.size = stat.st_size
+            try:
+                _drain_csv_upsert(csv_path, cursor, events, lock, stat.st_mtime)
+            except Exception:
+                continue  # best-effort tailer, like bench._csv_tailer
+        if stop_event.wait(scan_interval_s):
+            break
+
+
+def _drain_csv_upsert(csv_path: Path, cursor: "bench._CsvCursor",
+                      events: dict[tuple[str, int], "bench.Event"],
+                      lock: threading.Lock, mtime: float) -> None:
+    import csv as _stdcsv
+    import io as _io
+    with csv_path.open("r", newline="", encoding="utf-8") as fh:
+        if cursor.header is None:
+            header_line = fh.readline()
+            if not header_line.endswith("\n"):
+                return  # header still being written
+            cursor.header = next(_stdcsv.reader([header_line]))
+            cursor.offset = fh.tell()
+        fh.seek(cursor.offset)
+        chunk = fh.read()
+    if not chunk:
+        return
+    last_newline = chunk.rfind("\n")
+    if last_newline == -1:
+        return
+    complete = chunk[: last_newline + 1]
+    cursor.offset += len(complete.encode("utf-8"))
+    reader = _stdcsv.DictReader(_io.StringIO(complete), fieldnames=cursor.header)
+    with lock:
+        for row in reader:
+            name = row.get("device_name") or ""
+            ts_ms = bench._canonical_ts_ms(row.get("ts"))
+            if ts_ms is None or not name:
+                continue
+            event = _ensure_event(events, name, ts_ms)
+            if event.t_csv is None:
+                event.t_csv = mtime
+
+
+def _raw_observer_upsert(consumer, events: dict[tuple[str, int], "bench.Event"],
+                         lock: threading.Lock, stop_event: threading.Event) -> None:
+    """Raw-stage observer that UPSERTS: multi-process producers do not pre-insert
+    events, so this creates the Event on first sighting of a raw message. t_send is
+    the message's own ts (= producer send wall-clock ms); t_raw = the record's
+    intrinsic Kafka log timestamp (bench._record_time), i.e. when it landed in
+    tb.telemetry.raw -- NOT this observer's poll time, so T1 is observer-speed
+    independent and matches the broker log-end-offset truth. expected_validated=True
+    (multi-process capacity mode is pure-valid). Downstream observers (validated /
+    csv / ckan) then find the event, because raw is the first pipeline stage and
+    always arrives first."""
+    while not stop_event.is_set():
+        polled = consumer.poll(timeout_ms=200, max_records=5000)
+        if not polled:
+            continue
+        seen = time.time()
+        with lock:
+            for batch in polled.values():
+                for record in batch:
+                    value = record.value or {}
+                    name, ts_ms = bench._name_and_ts(value, bench._decode_headers(record))
+                    if ts_ms is None or not name:
+                        continue
+                    event = _ensure_event(events, name, ts_ms)
                     if event.t_raw is None:
-                        event.t_raw = seen
+                        event.t_raw = bench._record_time(record, seen)
 
 
 def run_single_step_mp(args: argparse.Namespace, rate: float, index: int,
@@ -347,13 +452,15 @@ def run_single_step_mp(args: argparse.Namespace, rate: float, index: int,
         val_consumer = bench._make_consumer(
             KafkaConsumer, config.KAFKA_TOPIC_TELEMETRY_VALIDATED,
             f"eval-{step_test_id}-validated-{ns}", args.bootstrap_server)
+        # All three stream observers upsert (see _ensure_event): with a scaled
+        # multi-partition pipeline no single observer is guaranteed to see a
+        # message's stage first, so each must be able to create the event.
         threads = [
             threading.Thread(target=_raw_observer_upsert, args=(
                 raw_consumer, events, lock, stop_event), daemon=True),
-            threading.Thread(target=bench._kafka_observer, args=(
-                val_consumer, config.KAFKA_TOPIC_TELEMETRY_VALIDATED, "validated",
-                events, lock, stop_event, {}), daemon=True),
-            threading.Thread(target=bench._csv_tailer, args=(
+            threading.Thread(target=_validated_observer_upsert, args=(
+                val_consumer, events, lock, stop_event), daemon=True),
+            threading.Thread(target=_csv_tailer_upsert, args=(
                 export_dir, events, lock, stop_event, args.csv_scan_interval_s),
                 daemon=True),
             threading.Thread(target=bench._ckan_poller, args=(
@@ -382,6 +489,27 @@ def run_single_step_mp(args: argparse.Namespace, rate: float, index: int,
             print(f"    [drain] complete in {drain_s:g}s.")
         else:
             print(f"    [drain] TIMEOUT after {drain_s:g}s (could not fully drain).")
+
+        # The pipeline can now drain FASTER than the benchmark's own Kafka
+        # observers (drain only tracks the CSV/CKAN path, which upserts its own
+        # events): stopping here truncated t_raw/t_validated counts and wrecked
+        # T1/T2 (first scaled rerun: T1 count ~72%). Their stamps are intrinsic
+        # record timestamps, so waiting adds no distortion -- wait until both
+        # counts quiesce before stopping the observers.
+        def _kafka_stamp_counts() -> tuple[int, int]:
+            with lock:
+                return (sum(1 for e in events.values() if e.t_raw is not None),
+                        sum(1 for e in events.values() if e.t_validated is not None))
+        prev_counts = _kafka_stamp_counts()
+        stable = 0
+        quiesce_deadline = time.time() + 300
+        while time.time() < quiesce_deadline and stable < 3:
+            time.sleep(2)
+            cur_counts = _kafka_stamp_counts()
+            stable = stable + 1 if cur_counts == prev_counts else 0
+            prev_counts = cur_counts
+        print(f"    [observers] kafka-stage stamps quiesced at raw={prev_counts[0]} "
+              f"validated={prev_counts[1]}.")
 
         stop_event.set()
         for thread in threads:

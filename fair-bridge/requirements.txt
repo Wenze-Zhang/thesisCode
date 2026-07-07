@@ -9,6 +9,11 @@ ckanapi==4.7
 # was ~55% of the per-message ETL CPU cost -- see evaluation/profile_etl.py.
 fastjsonschema==2.21.2
 
+# C JSON parser/serializer for the per-message hot path (ETL and exporter
+# de/serialize every telemetry message; stdlib json was a top CPU cost at the
+# single-process GIL ceiling -- see the 2026-07-07 CPU budget probe).
+orjson==3.10.15
+
 # YAML parsing for the canonical field registry (single source of truth)
 PyYAML==6.0.1
 
