@@ -190,6 +190,91 @@ t4._produce_load = _produce_load_mt
 
 
 # --------------------------------------------------------------------------- #
+# Steady-state (windowed) metric: stage crossings INSIDE the load window.
+# --------------------------------------------------------------------------- #
+_SS_STAGES: list[tuple[str, str]] = [
+    ("t_send", "ss_input_msg_s"),
+    ("t_raw", "ss_t1_msg_s"),
+    ("t_validated", "ss_t2_msg_s"),
+    ("t_csv", "ss_t3_msg_s"),
+    ("t_ckan", "ss_t4_msg_s"),
+]
+
+
+def _steady_state_rates(events: dict[tuple[str, int], "bench.Event"],
+                        s: float, e: float) -> dict[str, Any]:
+    """Full-load-window crossing rates: ss_T_X = (stage-X completions with
+    s <= t_X <= e) / (e - s), where [s, e] is first-to-last ACTUAL send.
+
+    Why not the makespan rate: makespan divides by (last completion - first
+    send), so past the knee the drain tail is inside the window. Draining is
+    faster than at-pace processing (the generator+TB are silent -> more host
+    CPU for ETL/exporter; deeper backlog -> fuller poll batches), so the
+    "plateau" climbs toward the DRAIN capacity as offered load rises. Counting
+    only completions inside the load window excludes the drain phase entirely:
+    under load ss_T_X == input rate (diagonal), past the knee it pins at the
+    at-pace capacity C_load (flat plateau).
+
+    Messages still in flight at e are NOT counted -- their absence IS the
+    overload signal, surfaced as ss_deliv < 1 and ss_backlog_growth_msg_s > 0.
+    Conservation (input >= T1 >= T2 >= T3 >= T4) holds because every step
+    starts from an empty pipeline (see _wait_pipeline_empty), so in-window
+    completions are a subset of in-window arrivals.
+    """
+    values = list(events.values())
+    window = max(e - s, 1e-6)
+    row: dict[str, Any] = {"ss_window_s": round(window, 3)}
+    for attr, col in _SS_STAGES:
+        row[col] = round(t4._count_in_window(values, attr, s, e) / window, 3)
+    row["ss_deliv"] = (round(row["ss_t4_msg_s"] / row["ss_input_msg_s"], 4)
+                       if row["ss_input_msg_s"] > 0 else None)
+    row["ss_backlog_growth_msg_s"] = round(
+        row["ss_input_msg_s"] - row["ss_t2_msg_s"], 3)
+    return row
+
+
+_measure_step_makespan = t4._measure_step
+
+
+def _measure_step_with_ss(*, args: argparse.Namespace,
+                          events: dict[tuple[str, int], "bench.Event"],
+                          rate: float, s: float, e: float, produced: int,
+                          failed_sends: int, drained: bool,
+                          drain_s: float) -> dict[str, Any]:
+    """t4._measure_step plus the ss_* windowed columns. Installed by rebinding
+    t4._measure_step (same pattern as the generator swap above), so both the
+    single-process step (t4.run_single_step) and run_single_step_mp get it."""
+    row = _measure_step_makespan(
+        args=args, events=events, rate=rate, s=s, e=e, produced=produced,
+        failed_sends=failed_sends, drained=drained, drain_s=drain_s)
+    row.update(_steady_state_rates(events, s, e))
+    return row
+
+
+t4._measure_step = _measure_step_with_ss
+
+
+def _wait_pipeline_empty(args: argparse.Namespace, timeout_s: float = 300.0) -> bool:
+    """Conservation guard for the ss_* metric: block until the exporter's
+    validated-topic lag is at/below the drain threshold so the step starts from
+    an empty pipeline. Without this, residue from a non-drained previous step
+    both steals capacity from this step and breaks the in-window conservation
+    argument. Returns False on timeout (the step still runs, but is flagged)."""
+    start = time.time()
+    deadline = start + timeout_s
+    while time.time() < deadline:
+        lag = bench._exporter_lag(
+            args.bootstrap_server, config.KAFKA_CONSUMER_GROUP_EXPORTER,
+            config.KAFKA_TOPIC_TELEMETRY_VALIDATED)
+        if lag is not None and lag <= args.drain_lag_threshold:
+            return True
+        print(f"    [isolation] pipeline not empty (exporter lag={lag}); "
+              f"waiting ({time.time() - start:.0f}s) ...")
+        time.sleep(5)
+    return False
+
+
+# --------------------------------------------------------------------------- #
 # Multi-PROCESS generator (lever 3): each producer process has its own GIL, so
 # the aggregate injected rate scales past the single-process ceiling (~1958 msg/s
 # here). Producers do NOT bookkeep events -- the main process reconstructs every
@@ -582,12 +667,18 @@ def run_steps_capacity(args: argparse.Namespace, KafkaConsumer) -> dict[str, Any
         for rep in range(1, reps + 1):
             print(f"\n=== step {index + 1}/{len(args.steps)} rep {rep}/{reps}: "
                   f"offered={rate:g} msg/s ({mode}) ===")
+            empty_at_start = _wait_pipeline_empty(args)
+            if not empty_at_start:
+                print("[capacity] WARNING: pipeline NOT empty at step start; "
+                      "this point's ss_* conservation is invalid (residual "
+                      "backlog steals capacity from the step).")
             if args.producer_procs > 1:
                 row = run_single_step_mp(args, rate, index * reps + (rep - 1), KafkaConsumer)
             else:
                 row = t4.run_single_step(args, rate, index * reps + (rep - 1), KafkaConsumer)
             row["step"] = index + 1
             row["rep"] = rep
+            row["ss_empty_at_start"] = empty_at_start
             row["producer_threads"] = args.producer_threads
             total_produced += row["produced_in_step"]
             rows.append(row)

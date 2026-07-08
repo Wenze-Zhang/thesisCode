@@ -306,7 +306,25 @@ def main() -> int:
                 key.removeprefix("tb_msg_md_"): value.decode("utf-8", "replace")
                 for key, value in (msg.headers or [])
             }
-            handle_message(ckan, reg, msg.value or {}, headers)
+            # Transient CKAN connection failures (uwsgi worker restart under a
+            # provisioning burst closes the socket mid-request) must not drop
+            # the lifecycle event: a skipped ENTITY_CREATED permanently orphans
+            # that device's telemetry (no dataset -> exporter retries forever).
+            # Retrying the whole message is idempotent: _existing_dataset
+            # re-checks and an already-created dataset is patched, not duped.
+            for attempt in range(1, 6):
+                try:
+                    handle_message(ckan, reg, msg.value or {}, headers)
+                    break
+                except (requests.exceptions.ConnectionError,
+                        requests.exceptions.Timeout) as exc:
+                    if attempt == 5:
+                        raise
+                    wait_s = 2.0 * attempt
+                    log.warning(
+                        "Transient CKAN error at offset %s (%s); "
+                        "retry %d/5 in %.0fs", msg.offset, exc, attempt, wait_s)
+                    time.sleep(wait_s)
         except Exception:
             log.exception("Error while processing message at offset %s", msg.offset)
 
