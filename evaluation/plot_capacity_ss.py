@@ -32,10 +32,10 @@ import plot_capacity as base  # noqa: E402  (reuse loader + house style)
 
 X_COL = "ss_input_msg_s"
 CURVES = [
-    ("ss_t1_msg_s", "T1 raw (Kafka)", "#2ca02c", "o"),
-    ("ss_t2_msg_s", "T2 validated (ETL)", "#1f77b4", "s"),
-    ("ss_t3_msg_s", "T3 csv (exporter)", "#9467bd", "^"),
-    ("ss_t4_msg_s", "T4 ckan (goodput)", "#d62728", "D"),
+    ("ss_t1_msg_s", "T1", "#2ca02c", "o"),
+    ("ss_t2_msg_s", "T2", "#1f77b4", "s"),
+    ("ss_t3_msg_s", "T3", "#9467bd", "^"),
+    ("ss_t4_msg_s", "T4", "#d62728", "D"),
 ]
 
 
@@ -83,9 +83,9 @@ def plot(rows: list[dict], out: Path) -> None:
                      markerfacecolor=(color if ok else "white"))
     axL.set_xlim(0, lim)
     axL.set_ylim(0, lim)
-    axL.set_xlabel("Steady-state input rate (msg/s)")
-    axL.set_ylabel("Per-stage steady-state throughput (msg/s)")
-    axL.set_title("Per-stage throughput inside the load window (drain excluded)")
+    axL.set_xlabel("achieved input rate (msg/s)")
+    axL.set_ylabel("throughput (msg/s)")
+    axL.set_title("throughput vs input rate")
     axL.legend(loc="upper left", fontsize=9, frameon=True)
     axL.grid(True, linestyle=":", alpha=0.4)
 
@@ -98,7 +98,7 @@ def plot(rows: list[dict], out: Path) -> None:
                  markerfacecolor=("#d62728" if ok else "white"))
     axR.set_xlim(0, lim)
     axR.set_ylim(0, 1.12)
-    axR.set_xlabel("Steady-state input rate (msg/s)")
+    axR.set_xlabel("achieved input rate (msg/s)")
     axR.set_ylabel("Delivery ratio (ss T4 / ss input)")
     axR.set_title("Steady-state delivery ratio (saturation knee)")
     axR.legend(loc="lower left", fontsize=9, frameon=True)

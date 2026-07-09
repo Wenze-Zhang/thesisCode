@@ -202,27 +202,36 @@ _SS_STAGES: list[tuple[str, str]] = [
 
 
 def _steady_state_rates(events: dict[tuple[str, int], "bench.Event"],
-                        s: float, e: float) -> dict[str, Any]:
-    """Full-load-window crossing rates: ss_T_X = (stage-X completions with
-    s <= t_X <= e) / (e - s), where [s, e] is first-to-last ACTUAL send.
+                        s: float, dwell_s: float) -> dict[str, Any]:
+    """Fixed-window crossing rates: ss_T_X = (stage-X completions with
+    s <= t_X <= s + dwell_s) / dwell_s, anchored at the FIRST send `s`.
 
-    Why not the makespan rate: makespan divides by (last completion - first
-    send), so past the knee the drain tail is inside the window. Draining is
-    faster than at-pace processing (the generator+TB are silent -> more host
-    CPU for ETL/exporter; deeper backlog -> fuller poll batches), so the
-    "plateau" climbs toward the DRAIN capacity as offered load rises. Counting
-    only completions inside the load window excludes the drain phase entirely:
-    under load ss_T_X == input rate (diagonal), past the knee it pins at the
-    at-pace capacity C_load (flat plateau).
+    The denominator is ALWAYS the nominal dwell (360s), NEVER the observed
+    first-to-last send span. Earlier this divided by (e - s) = last-minus-first
+    ACTUAL send; but that span drifts with producer start/stop stagger (a batch
+    whose 12 processes spread their sends over 387s read 93% of offered, while a
+    tightly-synced batch over 360s read 100%), making batches non-comparable on
+    the x-axis. A fixed dwell denominator is one standard for every point and
+    every batch: a batch that injected the full count in a tight 360s window
+    reads ss_input == offered; residual stagger shows as a mild, uniform
+    shortfall rather than a per-batch denominator artifact.
 
-    Messages still in flight at e are NOT counted -- their absence IS the
-    overload signal, surfaced as ss_deliv < 1 and ss_backlog_growth_msg_s > 0.
-    Conservation (input >= T1 >= T2 >= T3 >= T4) holds because every step
-    starts from an empty pipeline (see _wait_pipeline_empty), so in-window
-    completions are a subset of in-window arrivals.
+    Why still a windowed count (not makespan): makespan divides by (last
+    completion - first send), so past the knee the drain tail inflates the
+    denominator and the plateau climbs toward the DRAIN capacity. Counting only
+    completions inside the fixed load window [s, s + dwell_s] excludes the drain
+    phase entirely: under load ss_T_X == input rate (diagonal), past the knee it
+    pins at the at-pace capacity C_load (flat plateau).
+
+    Messages still in flight at s + dwell_s are NOT counted -- their absence IS
+    the overload signal (ss_deliv < 1, ss_backlog_growth_msg_s > 0). Conservation
+    (input >= T1 >= T2 >= T3 >= T4) holds because every step starts from an
+    empty pipeline (see _wait_pipeline_empty), so in-window completions are a
+    subset of in-window arrivals.
     """
     values = list(events.values())
-    window = max(e - s, 1e-6)
+    window = max(dwell_s, 1e-6)
+    e = s + window
     row: dict[str, Any] = {"ss_window_s": round(window, 3)}
     for attr, col in _SS_STAGES:
         row[col] = round(t4._count_in_window(values, attr, s, e) / window, 3)
@@ -247,7 +256,9 @@ def _measure_step_with_ss(*, args: argparse.Namespace,
     row = _measure_step_makespan(
         args=args, events=events, rate=rate, s=s, e=e, produced=produced,
         failed_sends=failed_sends, drained=drained, drain_s=drain_s)
-    row.update(_steady_state_rates(events, s, e))
+    # Standard fixed window anchored at first send, length = nominal dwell, so
+    # every point/batch shares one denominator (see _steady_state_rates).
+    row.update(_steady_state_rates(events, s, args.dwell_s))
     return row
 
 
@@ -649,6 +660,25 @@ def _cleanup_step_exports(args: argparse.Namespace) -> None:
         print(f"    [cleanup] removed {removed} export entries matching *{args.test_id}*")
 
 
+def _append_row_csv(args: argparse.Namespace, row: dict[str, Any],
+                    truncate: bool) -> None:
+    """Persist one measured row IMMEDIATELY after its step completes.
+
+    Crash-safety: rows used to live only in memory until write_outputs at the
+    end of the whole ramp -- the 2026-07-08 pcore run lost 9 finished steps
+    when Docker crashed during step 10. truncate=True on the first row of a
+    non-append run starts a fresh file; a header is written whenever the file
+    starts out empty or missing."""
+    csv_path = args.results_dir / "throughput_ramp4_summary.csv"
+    write_header = (truncate or not csv_path.exists()
+                    or csv_path.stat().st_size == 0)
+    with csv_path.open("w" if truncate else "a", newline="") as fh:
+        writer = _csv.DictWriter(fh, fieldnames=list(row.keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 # --------------------------------------------------------------------------- #
 # Outer loop: probe each offered load; map the plateau past the knee.
 # --------------------------------------------------------------------------- #
@@ -682,6 +712,9 @@ def run_steps_capacity(args: argparse.Namespace, KafkaConsumer) -> dict[str, Any
             row["producer_threads"] = args.producer_threads
             total_produced += row["produced_in_step"]
             rows.append(row)
+            _append_row_csv(args, row, truncate=(not args.append and len(rows) == 1))
+            print(f"    [persist] row written to "
+                  f"{args.results_dir / 'throughput_ramp4_summary.csv'}")
             if args.cleanup_exports:
                 _cleanup_step_exports(args)
             if not row["drained"] and args.stop_after_crash:
@@ -704,22 +737,18 @@ def run_steps_capacity(args: argparse.Namespace, KafkaConsumer) -> dict[str, Any
 
 
 def write_outputs_capacity(args: argparse.Namespace, summary: dict[str, Any]) -> None:
-    """Write/append the summary. In --append mode, append the new rows to the
-    existing combined CSV (no header) so low-load ramps and individually-run
-    high-load points accumulate into one curve; otherwise delegate to
-    t4.write_outputs (fresh CSV + JSON + table)."""
+    """Finalize outputs. Every row is already persisted the moment its step
+    finished (_append_row_csv, crash-safety), so in --append mode the CSV needs
+    no further writes -- just report and print the table. The non-append path
+    delegates to t4.write_outputs (JSON + table + a full CSV rewrite that is
+    byte-identical to the incrementally written file)."""
     rows = summary["rows"]
     if not rows:
         return
     args.results_dir.mkdir(parents=True, exist_ok=True)
     csv_path = args.results_dir / "throughput_ramp4_summary.csv"
-    if args.append and csv_path.exists():
-        fieldnames = list(rows[0].keys())
-        with csv_path.open("a", newline="") as fh:
-            writer = _csv.DictWriter(fh, fieldnames=fieldnames)
-            for row in rows:
-                writer.writerow(row)
-        print(f"Appended {len(rows)} rows to {csv_path}")
+    if args.append:
+        print(f"{len(rows)} rows appended per-step to {csv_path}")
         t4._print_table(summary)
     else:
         t4.write_outputs(args, summary)
